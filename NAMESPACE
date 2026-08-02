@@ -1,0 +1,3 @@
+useDynLib(fastxlsx, .registration = TRUE)
+export(read_xlsx)
+export(xlsx_sheets)

@@ -1,0 +1,12 @@
+Package: fastxlsx
+Type: Package
+Title: Fast 'xlsx' Reader
+Version: 0.0.0.9000
+Authors@R: person("Vincent", "Shields", email = "vince.shields913@gmail.com",
+    role = c("aut", "cre"))
+Description: Reads tabular data from 'xlsx' files with a specialized C parser.
+    Worksheet XML is scanned in a single pass and decoded directly into R
+    vectors, with no intermediate document model.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends: R (>= 4.0)
