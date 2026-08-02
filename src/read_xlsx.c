@@ -717,7 +717,19 @@ static void parse_sheet(buf_t sheet, grid_t *g, const unsigned char *xf_date, in
 }
 
 
-static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_sst)
+static str_t str_trim(str_t s)
+{
+    const char *p = s.p;
+    const char *e = s.p + s.n;
+    while (p < e && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) e--;
+    s.p = p;
+    s.n = (int)(e - p);
+    return s;
+}
+
+static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_sst,
+                         int trim)
 {
     char tmp[32];
     switch (cell_tag(c, row)) {
@@ -726,8 +738,10 @@ static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_ss
         if (i >= 0 && i < n_sst) return STRING_ELT(sst_table, i);
         return NA_STRING;
     }
-    case CELL_STR:
-        return mkCharLenCE(c->str[row].p, c->str[row].n, CE_UTF8);
+    case CELL_STR: {
+        str_t s = trim ? str_trim(c->str[row]) : c->str[row];
+        return mkCharLenCE(s.p, s.n, CE_UTF8);
+    }
     case CELL_NUM:
     case CELL_DATE:
         snprintf(tmp, sizeof tmp, "%.15g", c->num[row]);
@@ -740,10 +754,11 @@ static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_ss
     }
 }
 
-SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg)
+SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
 {
     const char *cpath = translateChar(STRING_ELT(path, 0));
     int want_names = asLogical(colNamesArg) == TRUE;
+    int trim = asLogical(trimArg) == TRUE;
 
     mz_zip_archive za;
     memset(&za, 0, sizeof za);
@@ -793,10 +808,12 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg)
     parse_sheet(sheet, &g, xf_date, n_xf);
 
     SEXP sst_table = PROTECT(allocVector(STRSXP, n_sst));
-    for (long i = 0; i < n_sst; i++)
+    for (long i = 0; i < n_sst; i++) {
+        str_t s = sst[i];
+        if (trim && s.p) s = str_trim(s);
         SET_STRING_ELT(sst_table, i,
-                       sst[i].p ? mkCharLenCE(sst[i].p, sst[i].n, CE_UTF8)
-                                : mkCharLen("", 0));
+                       s.p ? mkCharLenCE(s.p, s.n, CE_UTF8) : mkCharLen("", 0));
+    }
 
     /* trim fully-blank edge rows and columns */
     R_xlen_t r0 = 0, r1 = g.nrow;
@@ -858,7 +875,8 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg)
             col = allocVector(STRSXP, n);
             SET_VECTOR_ELT(ans, j, col);
             for (R_xlen_t r = data0; r < r1; r++)
-                SET_STRING_ELT(col, r - data0, cell_charsxp(c, r, sst_table, n_sst));
+                SET_STRING_ELT(col, r - data0,
+                               cell_charsxp(c, r, sst_table, n_sst, trim));
         } else if (nbool > 0 && nnum == 0 && ndate == 0) {
             col = allocVector(LGLSXP, n);
             SET_VECTOR_ELT(ans, j, col);
@@ -899,7 +917,7 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg)
         }
 
         if (want_names && r1 > r0) {
-            SEXP nm = cell_charsxp(&g.cols[c0 + j], r0, sst_table, n_sst);
+            SEXP nm = cell_charsxp(&g.cols[c0 + j], r0, sst_table, n_sst, trim);
             if (nm == NA_STRING) {
                 char tmp[16];
                 snprintf(tmp, sizeof tmp, "V%d", j + 1);
