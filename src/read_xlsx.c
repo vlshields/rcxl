@@ -505,7 +505,9 @@ enum {
     CELL_DATE,
     CELL_SST,
     CELL_STR,
-    CELL_BOOL
+    CELL_BOOL,
+    CELL_EMPTY   /* had a value that is empty/whitespace-only text: counts
+                    for sheet extent, but is NA and never affects typing */
 };
 
 typedef struct {
@@ -559,8 +561,23 @@ static void col_ensure_row(col_t *c, R_xlen_t row, R_xlen_t hint)
     c->cap = nc;
 }
 
+static str_t str_trim(str_t s)
+{
+    const char *p = s.p;
+    const char *e = s.p + s.n;
+    while (p < e && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) e--;
+    s.p = p;
+    s.n = (int)(e - p);
+    return s;
+}
+
 static void col_set_str(col_t *c, R_xlen_t row, str_t s)
 {
+    /* readxl semantics, independent of trim_ws: empty and whitespace-only
+       strings read as NA and don't influence typing, but the cell still
+       counts toward the sheet extent */
+    if (str_trim(s).n == 0) { c->tag[row] = CELL_EMPTY; return; }
     if (!c->str)
         c->str = (str_t *)R_alloc((size_t)c->cap, sizeof(str_t));
     c->tag[row] = CELL_STR;
@@ -698,7 +715,9 @@ static void parse_sheet(buf_t sheet, grid_t *g, const unsigned char *xf_date, in
                             memcpy(nbuf, vs, (size_t)vlen);
                             nbuf[vlen] = 0;
                             char *ep = NULL;
-                            double d = R_strtod(nbuf, &ep);
+                            /* strtod, not R_strtod: correctly rounded, so
+                               values agree bit-for-bit with other parsers */
+                            double d = strtod(nbuf, &ep);
                             if (ep && *ep == 0) {
                                 int isdate = style >= 0 && style < n_xf &&
                                              xf_date[style];
@@ -716,17 +735,6 @@ static void parse_sheet(buf_t sheet, grid_t *g, const unsigned char *xf_date, in
     }
 }
 
-
-static str_t str_trim(str_t s)
-{
-    const char *p = s.p;
-    const char *e = s.p + s.n;
-    while (p < e && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
-    while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) e--;
-    s.p = p;
-    s.n = (int)(e - p);
-    return s;
-}
 
 static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_sst,
                          int trim)
@@ -806,6 +814,23 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
     grid_t g;
     memset(&g, 0, sizeof g);
     parse_sheet(sheet, &g, xf_date, n_xf);
+
+    /* cells referencing empty/whitespace-only shared strings behave like
+       inline blanks; out-of-range references are treated the same way */
+    unsigned char *sst_blank =
+        n_sst ? (unsigned char *)R_alloc((size_t)n_sst, 1) : NULL;
+    for (long i = 0; i < n_sst; i++)
+        sst_blank[i] = !sst[i].p || str_trim(sst[i]).n == 0;
+    for (int j = 0; j < g.ncols; j++) {
+        col_t *c = &g.cols[j];
+        R_xlen_t rmax = c->cap < g.nrow ? c->cap : g.nrow;
+        for (R_xlen_t r = 0; r < rmax; r++)
+            if (c->tag[r] == CELL_SST) {
+                long i = (long)c->num[r];
+                if (i < 0 || i >= n_sst || sst_blank[i])
+                    c->tag[r] = CELL_EMPTY;
+            }
+    }
 
     SEXP sst_table = PROTECT(allocVector(STRSXP, n_sst));
     for (long i = 0; i < n_sst; i++) {
