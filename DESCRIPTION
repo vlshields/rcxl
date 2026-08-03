@@ -1,6 +1,6 @@
-Package: fastxlsx
+Package: rcxl
 Type: Package
-Title: Fast 'xlsx' Reader
+Title: Parse Excel Files
 Version: 0.0.0.9000
 Authors@R: person("Vincent", "Shields", email = "vince.shields913@gmail.com",
     role = c("aut", "cre"))
