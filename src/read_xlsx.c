@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <R.h>
 #include <Rinternals.h>
 #include <R_ext/Utils.h>
@@ -589,6 +590,63 @@ static unsigned char cell_tag(const col_t *c, R_xlen_t row)
     return row < c->cap ? c->tag[row] : (unsigned char)CELL_BLANK;
 }
 
+/* Correctly rounded decimal-to-double fast path. When the significand fits
+   exactly in a double (<= 2^53) and the power of ten is exactly
+   representable (|exp| <= 22), one IEEE multiply or divide of two exact
+   operands is correctly rounded by construction, so the result is
+   bit-identical to strtod at a fraction of its cost. Anything else -- too
+   many digits, extreme exponents, inf/nan/hex forms -- returns 0 for the
+   caller to hand to strtod. */
+static int parse_num_fast(const char *s, int n, double *out)
+{
+    static const double p10[23] = {
+        1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,
+        1e8,  1e9,  1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+        1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
+    };
+    const char *p = s, *e = s + n;
+    int neg = 0;
+    if (p < e && (*p == '-' || *p == '+')) neg = (*p == '-'), p++;
+    uint64_t sig = 0;
+    int exp10 = 0, ndig = 0, saw_digit = 0, saw_dot = 0;
+    for (; p < e; p++) {
+        if (*p >= '0' && *p <= '9') {
+            saw_digit = 1;
+            if (ndig < 19) {
+                sig = sig * 10 + (uint64_t)(*p - '0');
+                if (sig) ndig++;
+                if (saw_dot) exp10--;
+            } else
+                return 0;
+        } else if (*p == '.') {
+            if (saw_dot) return 0;
+            saw_dot = 1;
+        } else if (*p == 'e' || *p == 'E') {
+            if (!saw_digit || ++p >= e) return 0;
+            int eneg = 0, ev = 0;
+            if (*p == '-' || *p == '+') { eneg = (*p == '-'); p++; }
+            if (p >= e) return 0;
+            for (; p < e; p++) {
+                if (*p < '0' || *p > '9' || ev > 9999) return 0;
+                ev = ev * 10 + (*p - '0');
+            }
+            exp10 += eneg ? -ev : ev;
+            break;
+        } else
+            return 0;
+    }
+    if (!saw_digit || sig > (1ULL << 53)) return 0;
+    double d;
+    if (exp10 >= 0 && exp10 <= 22)
+        d = (double)sig * p10[exp10];
+    else if (exp10 < 0 && exp10 >= -22)
+        d = (double)sig / p10[-exp10];
+    else
+        return 0;
+    *out = neg ? -d : d;
+    return 1;
+}
+
 static void parse_sheet(buf_t sheet, grid_t *g, const unsigned char *xf_date, int n_xf)
 {
     const char *end = sheet.p + sheet.n;
@@ -711,14 +769,19 @@ static void parse_sheet(buf_t sheet, grid_t *g, const unsigned char *xf_date, in
                         } else if (t == 'r' || t == 'd') {
                             col_set_str(c, row, xml_unescape(vs, vlen));
                         } else if (vlen > 0 && vlen < 64) {
-                            char nbuf[64];
-                            memcpy(nbuf, vs, (size_t)vlen);
-                            nbuf[vlen] = 0;
-                            char *ep = NULL;
-                            /* strtod, not R_strtod: correctly rounded, so
-                               values agree bit-for-bit with other parsers */
-                            double d = strtod(nbuf, &ep);
-                            if (ep && *ep == 0) {
+                            double d;
+                            int ok = parse_num_fast(vs, vlen, &d);
+                            if (!ok) {
+                                /* strtod, not R_strtod: correctly rounded,
+                                   matching the fast path bit-for-bit */
+                                char nbuf[64];
+                                memcpy(nbuf, vs, (size_t)vlen);
+                                nbuf[vlen] = 0;
+                                char *ep = NULL;
+                                d = strtod(nbuf, &ep);
+                                ok = ep && *ep == 0;
+                            }
+                            if (ok) {
                                 int isdate = style >= 0 && style < n_xf &&
                                              xf_date[style];
                                 c->tag[row] = isdate ? CELL_DATE : CELL_NUM;
