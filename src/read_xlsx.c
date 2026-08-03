@@ -888,11 +888,17 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
             col = allocVector(REALSXP, n);
             SET_VECTOR_ELT(ans, j, col);
             double *dp = REAL(col);
-            for (R_xlen_t r = data0; r < r1; r++)
-                dp[r - data0] = cell_tag(c, r) == CELL_DATE
-                                    ? (c->num[r] - epoch) * 86400.0
-                                    : (cell_tag(c, r) == CELL_BOOL
-                                           ? NA_REAL : NA_REAL);
+            for (R_xlen_t r = data0; r < r1; r++) {
+                if (cell_tag(c, r) != CELL_DATE) {
+                    dp[r - data0] = NA_REAL;
+                    continue;
+                }
+                double serial = c->num[r];
+                /* Excel's 1900 system counts a nonexistent 1900-02-29;
+                   serials before it are one day behind the real calendar. */
+                if (!date1904 && serial < 61.0) serial += 1.0;
+                dp[r - data0] = (serial - epoch) * 86400.0;
+            }
             SEXP kl = PROTECT(allocVector(STRSXP, 2));
             SET_STRING_ELT(kl, 0, mkChar("POSIXct"));
             SET_STRING_ELT(kl, 1, mkChar("POSIXt"));
