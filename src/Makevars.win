@@ -5,5 +5,5 @@ LIBDEFLATE_OBJS = libdeflate/lib/deflate_decompress.o libdeflate/lib/utils.o \
 
 OBJECTS = init.o miniz.o read_xlsx.o $(LIBDEFLATE_OBJS)
 
-PKG_CFLAGS = -pthread
-PKG_LIBS = -pthread
+# Rtools ships winpthreads
+PKG_LIBS = -lpthread

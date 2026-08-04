@@ -1,10 +1,13 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <math.h>
 #include <R.h>
 #include <Rinternals.h>
 #include <R_ext/Utils.h>
 #include "miniz.h"
+#include "libdeflate.h"
+#include "xthread.h"
 
 
 typedef struct { char *p; size_t n; } buf_t;
@@ -222,14 +225,142 @@ static str_t collect_text(const char *p, const char *end)
 }
 
 
-static int zread(mz_zip_archive *za, const char *name, buf_t *out)
+/* Persistent scratch arena for the large transient buffers (file bytes,
+   decompressed parts, grid arrays).  R_alloc would hand the pages back to
+   the OS after every call, so each read would re-fault its whole working
+   set; these malloc blocks are kept across calls and reused warm.  Entered
+   only from the single R thread (workers never allocate), reset on entry,
+   and trimmed so at most ~256MB stays cached.  A longjmp from error()
+   cannot leak blocks: they stay owned by the static list. */
+typedef struct sblock {
+    struct sblock *next;
+    size_t cap, used;
+} sblock_t;
+
+static sblock_t *g_scratch;
+
+static void scratch_reset(void)
 {
-    int idx = mz_zip_reader_locate_file(za, name, NULL, 0);
+    size_t total = 0;
+    sblock_t **pb = &g_scratch;
+    while (*pb) {
+        sblock_t *b = *pb;
+        total += b->cap;
+        if (total > ((size_t)256 << 20)) {
+            *pb = b->next;
+            free(b);
+            continue;
+        }
+        b->used = 0;
+        pb = &b->next;
+    }
+}
+
+static void *scratch_alloc(size_t n)
+{
+    n = (n + 15u) & ~(size_t)15;
+    for (sblock_t *b = g_scratch; b; b = b->next)
+        if (b->cap - b->used >= n) {
+            void *p = (char *)(b + 1) + b->used;
+            b->used += n;
+            return p;
+        }
+    size_t cap = g_scratch && g_scratch->cap >= n ? g_scratch->cap * 2 : n;
+    if (cap < ((size_t)1 << 20)) cap = (size_t)1 << 20;
+    sblock_t *b = (sblock_t *)malloc(sizeof(sblock_t) + cap);
+    if (!b && cap > n) b = (sblock_t *)malloc(sizeof(sblock_t) + (cap = n));
+    if (!b) error("cannot allocate %lu bytes", (unsigned long)n);
+    b->cap = cap;
+    b->used = n;
+    b->next = g_scratch;
+    g_scratch = b;
+    return b + 1;
+}
+
+/* read the whole file into one scratch buffer so the zip walk and part
+   extraction run over memory instead of 64KB fread chunks */
+static char *slurp_file(const char *path, size_t *out_n)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseeko(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    off_t sz = ftello(f);
+    if (sz < 0 || fseeko(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    char *buf = scratch_alloc((size_t)sz + 1);
+    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *out_n = (size_t)sz;
+    return buf;
+}
+
+/* zip container: miniz walks the central directory; payload bytes are
+   located via the local header and inflated with libdeflate */
+typedef struct {
+    mz_zip_archive za;
+    const char *data;
+    size_t n;
+    struct libdeflate_decompressor *infl;
+} zipsrc_t;
+
+/* libdeflate allocations come from the scratch arena so an error() longjmp
+   cannot leak them; free is a no-op for the same reason */
+static void *ld_malloc(size_t n) { return scratch_alloc(n); }
+static void ld_free(void *p) { (void)p; }
+
+static int zopen(zipsrc_t *z, const char *path)
+{
+    z->data = slurp_file(path, &z->n);
+    if (!z->data) return 0;
+    memset(&z->za, 0, sizeof z->za);
+    if (!mz_zip_reader_init_mem(&z->za, z->data, z->n, 0)) return 0;
+    struct libdeflate_options opt = {sizeof opt, ld_malloc, ld_free};
+    z->infl = libdeflate_alloc_decompressor_ex(&opt);
+    if (!z->infl) { mz_zip_reader_end(&z->za); return 0; }
+    return 1;
+}
+
+static void zclose(zipsrc_t *z)
+{
+    mz_zip_reader_end(&z->za);
+}
+
+/* locate the part's payload in the whole-file buffer: the local header's own
+   name/extra lengths can differ from the central directory's copy */
+static const char *zpayload(const zipsrc_t *z, const mz_zip_archive_file_stat *st)
+{
+    mz_uint64 ofs = st->m_local_header_ofs;
+    if (ofs + 30 > z->n) return NULL;
+    const unsigned char *lh = (const unsigned char *)z->data + ofs;
+    if (memcmp(lh, "PK\x03\x04", 4) != 0) return NULL;
+    size_t namelen = (size_t)lh[26] | ((size_t)lh[27] << 8);
+    size_t extralen = (size_t)lh[28] | ((size_t)lh[29] << 8);
+    mz_uint64 start = ofs + 30 + namelen + extralen;
+    if (start + st->m_comp_size > z->n) return NULL;
+    return z->data + start;
+}
+
+static int zread(zipsrc_t *z, const char *name, buf_t *out)
+{
+    int idx = mz_zip_reader_locate_file(&z->za, name, NULL, 0);
     if (idx < 0) return 0;
     mz_zip_archive_file_stat st;
-    if (!mz_zip_reader_file_stat(za, (mz_uint)idx, &st)) return 0;
-    char *buf = R_alloc((size_t)st.m_uncomp_size + 1, 1);
-    if (!mz_zip_reader_extract_to_mem(za, (mz_uint)idx, buf, (size_t)st.m_uncomp_size, 0))
+    if (!mz_zip_reader_file_stat(&z->za, (mz_uint)idx, &st)) return 0;
+    const char *payload = zpayload(z, &st);
+    if (!payload) return 0;
+    char *buf = scratch_alloc((size_t)st.m_uncomp_size + 1);
+    if (st.m_method == 0) {
+        if (st.m_comp_size < st.m_uncomp_size) return 0;
+        memcpy(buf, payload, (size_t)st.m_uncomp_size);
+    } else if (st.m_method == 8) {
+        size_t got = 0;
+        if (libdeflate_deflate_decompress(z->infl, payload, (size_t)st.m_comp_size,
+                                          buf, (size_t)st.m_uncomp_size, &got)
+                != LIBDEFLATE_SUCCESS || got != (size_t)st.m_uncomp_size)
+            return 0;
+    } else
         return 0;
     buf[st.m_uncomp_size] = 0;
     out->p = buf;
@@ -356,10 +487,13 @@ static void parse_styles(buf_t sty, unsigned char **xf_date_out, int *n_xf_out)
 }
 
 
-static void parse_sst(buf_t sst, str_t **out, long *n_out)
+static str_t str_trim(str_t s);
+
+static void parse_sst(buf_t sst, str_t **out, long *n_out, unsigned char **blank_out)
 {
     *out = NULL;
     *n_out = 0;
+    *blank_out = NULL;
     if (!sst.p) return;
     const char *end = sst.p + sst.n;
     long cap = 0;
@@ -374,7 +508,8 @@ static void parse_sst(buf_t sst, str_t **out, long *n_out)
         }
     }
     if (cap <= 0) cap = 1024;
-    str_t *arr = (str_t *)R_alloc((size_t)cap, sizeof(str_t));
+    str_t *arr = (str_t *)scratch_alloc((size_t)cap * sizeof(str_t));
+    unsigned char *blank = (unsigned char *)scratch_alloc((size_t)cap);
     long n = 0;
     const char *p = sst.p;
     while ((p = find_tag(p, end, "<si")) != NULL) {
@@ -383,9 +518,12 @@ static void parse_sst(buf_t sst, str_t **out, long *n_out)
         const char *stop = self ? body : sfind(body, end, "</si>");
         if (!stop) stop = end;
         if (n == cap) {
-            str_t *na = (str_t *)R_alloc((size_t)cap * 2, sizeof(str_t));
+            str_t *na = (str_t *)scratch_alloc((size_t)cap * 2 * sizeof(str_t));
+            unsigned char *nb = (unsigned char *)scratch_alloc((size_t)cap * 2);
             memcpy(na, arr, (size_t)n * sizeof(str_t));
+            memcpy(nb, blank, (size_t)n);
             arr = na;
+            blank = nb;
             cap *= 2;
         }
         if (self) {
@@ -393,11 +531,14 @@ static void parse_sst(buf_t sst, str_t **out, long *n_out)
             arr[n].n = 0;
         } else
             arr[n] = collect_text(body, stop);
+        /* cells referencing empty/whitespace-only entries read as blanks */
+        blank[n] = !arr[n].p || str_trim(arr[n]).n == 0;
         n++;
         p = stop;
     }
     *out = arr;
     *n_out = n;
+    *blank_out = blank;
 }
 
 
@@ -507,8 +648,10 @@ enum {
     CELL_SST,
     CELL_STR,
     CELL_BOOL,
-    CELL_EMPTY   /* had a value that is empty/whitespace-only text: counts
+    CELL_EMPTY,  /* had a value that is empty/whitespace-only text: counts
                     for sheet extent, but is NA and never affects typing */
+    CELL_STR_RAW,/* value slice still XML-escaped; decoded at materialization */
+    CELL_IS_RAW  /* <is> body slice; runs collected at materialization */
 };
 
 typedef struct {
@@ -516,6 +659,10 @@ typedef struct {
     double *num;
     str_t *str;      /* lazily allocated; only for CELL_STR */
     R_xlen_t cap;
+    /* running tallies maintained as cells land, so typing and extent need
+       no extra passes over the grid afterward */
+    R_xlen_t nnum, ndate, nbool, nstr;
+    R_xlen_t nonblank;   /* includes CELL_EMPTY: counts toward extent */
 } col_t;
 
 typedef struct {
@@ -523,7 +670,9 @@ typedef struct {
     int ncols, ncols_cap;
     R_xlen_t nrow;
     R_xlen_t row_cap_hint;
+    R_xlen_t rmin, rmax; /* global non-blank row extent; rmax < 0 = none */
 } grid_t;
+
 
 static void grid_ensure_col(grid_t *g, int col)
 {
@@ -531,7 +680,7 @@ static void grid_ensure_col(grid_t *g, int col)
     if (col >= g->ncols_cap) {
         int nc = g->ncols_cap ? g->ncols_cap : 16;
         while (nc <= col) nc *= 2;
-        col_t *na = (col_t *)R_alloc((size_t)nc, sizeof(col_t));
+        col_t *na = (col_t *)scratch_alloc((size_t)nc * sizeof(col_t));
         if (g->cols) memcpy(na, g->cols, (size_t)g->ncols * sizeof(col_t));
         memset(na + g->ncols, 0, (size_t)(nc - g->ncols) * sizeof(col_t));
         g->cols = na;
@@ -545,15 +694,15 @@ static void col_ensure_row(col_t *c, R_xlen_t row, R_xlen_t hint)
     if (row < c->cap) return;
     R_xlen_t nc = c->cap ? c->cap * 2 : (hint > 0 ? hint : 256);
     while (nc <= row) nc *= 2;
-    unsigned char *tag = (unsigned char *)R_alloc((size_t)nc, 1);
-    double *num = (double *)R_alloc((size_t)nc, sizeof(double));
+    unsigned char *tag = (unsigned char *)scratch_alloc((size_t)nc);
+    double *num = (double *)scratch_alloc((size_t)nc * sizeof(double));
     memset(tag, 0, (size_t)nc);
     if (c->tag) {
         memcpy(tag, c->tag, (size_t)c->cap);
         memcpy(num, c->num, (size_t)c->cap * sizeof(double));
     }
     if (c->str) {
-        str_t *str = (str_t *)R_alloc((size_t)nc, sizeof(str_t));
+        str_t *str = (str_t *)scratch_alloc((size_t)nc * sizeof(str_t));
         memcpy(str, c->str, (size_t)c->cap * sizeof(str_t));
         c->str = str;
     }
@@ -573,17 +722,6 @@ static str_t str_trim(str_t s)
     return s;
 }
 
-static void col_set_str(col_t *c, R_xlen_t row, str_t s)
-{
-    /* readxl semantics, independent of trim_ws: empty and whitespace-only
-       strings read as NA and don't influence typing, but the cell still
-       counts toward the sheet extent */
-    if (str_trim(s).n == 0) { c->tag[row] = CELL_EMPTY; return; }
-    if (!c->str)
-        c->str = (str_t *)R_alloc((size_t)c->cap, sizeof(str_t));
-    c->tag[row] = CELL_STR;
-    c->str[row] = s;
-}
 
 static unsigned char cell_tag(const col_t *c, R_xlen_t row)
 {
@@ -647,35 +785,95 @@ static int parse_num_fast(const char *s, int n, double *out)
     return 1;
 }
 
-static void parse_sheet(buf_t sheet, grid_t *g, const unsigned char *xf_date, int n_xf)
+/* ---- sheet parsing ----
+   The row loop is chunk-based so it can run serially over the whole buffer
+   or data-parallel over disjoint row ranges.  Unless ck->can_grow (serial
+   mode) parse_rows never calls into R: tallies go to chunk-private arrays,
+   string cells store zero-copy slices, and anything that would need
+   allocation (entity decoding, multi-run inline strings) is deferred to
+   materialization on the main thread. */
+
+#define CNT_NUM 0
+#define CNT_DATE 1
+#define CNT_BOOL 2
+#define CNT_STR 3
+#define CNT_NONBLANK 4
+#define MAX_COLS 16384
+
+typedef struct {
+    const char *begin, *end;
+    grid_t *g;
+    const unsigned char *xf_date;
+    int n_xf;
+    const unsigned char *sst_blank;
+    long n_sst;
+    unsigned char *sst_used;   /* chunk-private in threaded mode */
+    R_xlen_t *counts;          /* chunk-private, [MAX_COLS * 5] */
+    R_xlen_t rmin, rmax;
+    long row_lo, row_hi;       /* allowed 0-based rows [lo,hi); hi<0: open */
+    int can_grow;              /* serial mode: may allocate through R */
+    int fail;                  /* threaded bail: rerun serially */
+} chunk_t;
+
+static void chunk_extent(chunk_t *ck, int col, R_xlen_t row)
 {
-    const char *end = sheet.p + sheet.n;
-    const char *p;
+    ck->counts[col * 5 + CNT_NONBLANK]++;
+    if (row < ck->rmin) ck->rmin = row;
+    if (row > ck->rmax) ck->rmax = row;
+}
 
-    p = find_tag(sheet.p, end, "<dimension");
-    if (p) {
-        attr_t a;
-        const char *q = p + 10;
-        const char *q2;
-        while ((q2 = next_attr(q, end, &a)) != NULL) {
-            if (attr_is(&a, "ref")) {
-                const char *colon = memchr(a.v, ':', (size_t)a.vlen);
-                if (colon) {
-                    const char *r2 = colon + 1;
-                    int len = (int)(a.v + a.vlen - r2);
-                    int i = 0;
-                    while (i < len && !(r2[i] >= '0' && r2[i] <= '9')) i++;
-                    g->row_cap_hint = slice_long(r2 + i, len - i);
-                    int c = ref_col(r2, len);
-                    if (c >= 0 && c < 16384) grid_ensure_col(g, c);
-                }
-            }
-            q = q2;
-        }
+/* store a string cell: CELL_STR holds a ready slice; the RAW tags hold
+   slices decoded at materialization time.  Empty/whitespace-only text reads
+   as NA without influencing typing (readxl semantics), but still counts
+   toward the sheet extent. */
+static void chunk_set_str(chunk_t *ck, col_t *c, int col, R_xlen_t row,
+                          str_t s, unsigned char tag)
+{
+    chunk_extent(ck, col, row);
+    if (tag == CELL_STR && str_trim(s).n == 0) {
+        c->tag[row] = CELL_EMPTY;
+        return;
     }
+    if (!c->str) {
+        if (!ck->can_grow) { ck->fail = 1; return; }
+        c->str = (str_t *)scratch_alloc((size_t)c->cap * sizeof(str_t));
+    }
+    c->tag[row] = tag;
+    c->str[row] = s;
+    ck->counts[col * 5 + CNT_STR]++;
+}
 
-    long cur_row = -1;
-    p = sheet.p;
+/* a still-escaped value slice: zero-copy unless it contains entities */
+static void chunk_set_value_str(chunk_t *ck, col_t *c, int col, R_xlen_t row,
+                                const char *vs, int vlen)
+{
+    str_t s = {vs, vlen};
+    if (vlen > 0 && memchr(vs, '&', (size_t)vlen) != NULL)
+        chunk_set_str(ck, c, col, row, s, CELL_STR_RAW);
+    else
+        chunk_set_str(ck, c, col, row, s, CELL_STR);
+}
+
+/* inline string cell: zero-copy slice if it is a single entity-free run */
+static int inline_zero_copy(const char *body, const char *cend, str_t *out)
+{
+    str_t run;
+    const char *after = next_text_run(body, cend, &run);
+    if (!after) { out->p = body; out->n = 0; return 1; }   /* no text runs */
+    str_t run2;
+    if (next_text_run(after, cend, &run2) != NULL) return 0;
+    if (run.n > 0 && memchr(run.p, '&', (size_t)run.n) != NULL) return 0;
+    *out = run;
+    return 1;
+}
+
+static void parse_rows(chunk_t *ck)
+{
+    grid_t *g = ck->g;
+    const char *end = ck->end;
+    const char *p = ck->begin;
+    long cur_row = ck->row_lo - 1;
+
     for (;;) {
         p = find_tag(p, end, "<row");
         if (!p) break;
@@ -689,9 +887,18 @@ static void parse_sheet(buf_t sheet, grid_t *g, const unsigned char *xf_date, in
             q = q2;
         }
         p = tag_close(q, end, &self);
-        cur_row = rnum > 0 ? rnum - 1 : cur_row + 1;
+        if (rnum > 0)
+            cur_row = rnum - 1;
+        else {
+            /* implied row number: fine serially, breaks chunk disjointness */
+            if (!ck->can_grow) { ck->fail = 1; return; }
+            cur_row++;
+        }
+        if (cur_row < ck->row_lo || (ck->row_hi >= 0 && cur_row >= ck->row_hi)) {
+            ck->fail = 1;
+            return;
+        }
         R_xlen_t row = (R_xlen_t)cur_row;
-        if (row + 1 > g->nrow) g->nrow = row + 1;
         if (self) continue;
 
         int last_col = -1;
@@ -734,68 +941,328 @@ static void parse_sheet(buf_t sheet, grid_t *g, const unsigned char *xf_date, in
             p = tag_close(q, end, &self);
             if (col < 0) col = last_col + 1;
             last_col = col;
-            if (col >= 16384) continue;
-            grid_ensure_col(g, col);
+            if (col >= MAX_COLS) continue;
+            if (col >= g->ncols) {
+                if (!ck->can_grow) { ck->fail = 1; return; }
+                grid_ensure_col(g, col);
+            }
             col_t *c = &g->cols[col];
-            col_ensure_row(c, row, g->row_cap_hint);
+            if (row >= c->cap) {
+                if (!ck->can_grow) { ck->fail = 1; return; }
+                col_ensure_row(c, row, g->row_cap_hint);
+            }
             if (self) continue;
 
-            const char *cend = sfind(p, end, "</c>");
-            if (!cend) cend = end;
-
             if (t == 'i') {
+                const char *cend = sfind(p, end, "</c>");
+                if (!cend) cend = end;
                 const char *is = find_tag(p, cend, "<is");
                 if (is) {
                     int s2;
                     const char *body = tag_close(is + 3, cend, &s2);
-                    if (!s2) col_set_str(c, row, collect_text(body, cend));
-                }
-            } else if (t != 'e') {
-                const char *v = find_tag(p, cend, "<v");
-                if (v) {
-                    int s2;
-                    const char *vs = tag_close(v + 2, cend, &s2);
                     if (!s2) {
-                        const char *ve = sfind(vs, cend, "</v>");
-                        if (!ve) ve = cend;
-                        int vlen = (int)(ve - vs);
-                        if (t == 's') {
-                            c->tag[row] = CELL_SST;
-                            c->num[row] = (double)slice_long(vs, vlen);
-                        } else if (t == 'b') {
-                            c->tag[row] = CELL_BOOL;
-                            c->num[row] = (vlen > 0 && (vs[0] == '1' || vs[0] == 't'))
-                                              ? 1.0 : 0.0;
-                        } else if (t == 'r' || t == 'd') {
-                            col_set_str(c, row, xml_unescape(vs, vlen));
-                        } else if (vlen > 0 && vlen < 64) {
-                            double d;
-                            int ok = parse_num_fast(vs, vlen, &d);
-                            if (!ok) {
-                                /* strtod, not R_strtod: correctly rounded,
-                                   matching the fast path bit-for-bit */
-                                char nbuf[64];
-                                memcpy(nbuf, vs, (size_t)vlen);
-                                nbuf[vlen] = 0;
-                                char *ep = NULL;
-                                d = strtod(nbuf, &ep);
-                                ok = ep && *ep == 0;
-                            }
-                            if (ok) {
-                                int isdate = style >= 0 && style < n_xf &&
-                                             xf_date[style];
-                                c->tag[row] = isdate ? CELL_DATE : CELL_NUM;
-                                c->num[row] = d;
-                            } else
-                                col_set_str(c, row, xml_unescape(vs, vlen));
-                        } else if (vlen > 0)
-                            col_set_str(c, row, xml_unescape(vs, vlen));
+                        str_t s;
+                        if (inline_zero_copy(body, cend, &s))
+                            chunk_set_str(ck, c, col, row, s, CELL_STR);
+                        else {
+                            str_t raw = {body, (int)(cend - body)};
+                            chunk_set_str(ck, c, col, row, raw, CELL_IS_RAW);
+                        }
                     }
                 }
+                p = cend < end ? cend + 4 : end;
+                continue;
             }
-            p = cend < end ? cend + 4 : end;
+            if (t == 'e') continue;   /* outer loop skims the error body */
+
+            /* one forward sweep: find <v> (skipping <f>...</f>) or hit </c> */
+            const char *vs = NULL;
+            const char *q3 = p;
+            for (;;) {
+                q3 = memchr(q3, '<', (size_t)(end - q3));
+                if (!q3 || end - q3 < 4) { p = end; break; }
+                if (q3[1] == 'v' && (q3[2] == '>' || q3[2] == ' ')) {
+                    int s2;
+                    vs = tag_close(q3 + 2, end, &s2);
+                    if (s2) vs = NULL;
+                    break;
+                }
+                if (q3[1] == '/') {
+                    if (q3[2] == 'c' && q3[3] == '>') { p = q3 + 4; break; }
+                    if (q3[2] == 'r') { p = q3; break; }  /* row closed early */
+                    q3 += 2;
+                    continue;
+                }
+                if (q3[1] == 'f') {   /* formula body may contain quoted "<c" */
+                    const char *fe = sfind(q3, end, "</f>");
+                    if (!fe) { p = end; break; }
+                    q3 = fe + 4;
+                    continue;
+                }
+                q3++;
+            }
+            if (!vs) continue;
+            /* value text is XML-escaped, so the next '<' is exactly </v> */
+            const char *ve = memchr(vs, '<', (size_t)(end - vs));
+            if (!ve) ve = end;
+            int vlen = (int)(ve - vs);
+            p = end - ve >= 4 ? ve + 4 : end;
+            if (end - p >= 4 && p[0] == '<' && p[1] == '/' && p[2] == 'c' &&
+                p[3] == '>')
+                p += 4;   /* skip </c> here rather than re-scanning it */
+
+            if (t == 's') {
+                long i = slice_long(vs, vlen);
+                chunk_extent(ck, col, row);
+                if (i < 0 || i >= ck->n_sst || ck->sst_blank[i]) {
+                    c->tag[row] = CELL_EMPTY;
+                } else {
+                    c->tag[row] = CELL_SST;
+                    c->num[row] = (double)i;
+                    ck->counts[col * 5 + CNT_STR]++;
+                    ck->sst_used[i] = 1;
+                }
+            } else if (t == 'b') {
+                chunk_extent(ck, col, row);
+                c->tag[row] = CELL_BOOL;
+                c->num[row] = (vlen > 0 && (vs[0] == '1' || vs[0] == 't'))
+                                  ? 1.0 : 0.0;
+                ck->counts[col * 5 + CNT_BOOL]++;
+            } else if (t == 'r' || t == 'd') {
+                chunk_set_value_str(ck, c, col, row, vs, vlen);
+            } else if (vlen > 0 && vlen < 64) {
+                double d;
+                int ok = parse_num_fast(vs, vlen, &d);
+                if (!ok) {
+                    /* strtod, not R_strtod: correctly rounded,
+                       matching the fast path bit-for-bit */
+                    char nbuf[64];
+                    memcpy(nbuf, vs, (size_t)vlen);
+                    nbuf[vlen] = 0;
+                    char *ep = NULL;
+                    d = strtod(nbuf, &ep);
+                    ok = ep && *ep == 0;
+                }
+                if (ok) {
+                    int isdate = style >= 0 && style < ck->n_xf &&
+                                 ck->xf_date[style];
+                    chunk_extent(ck, col, row);
+                    if (isdate) {
+                        c->tag[row] = CELL_DATE;
+                        ck->counts[col * 5 + CNT_DATE]++;
+                    } else {
+                        c->tag[row] = CELL_NUM;
+                        ck->counts[col * 5 + CNT_NUM]++;
+                    }
+                    c->num[row] = d;
+                } else
+                    chunk_set_value_str(ck, c, col, row, vs, vlen);
+            } else if (vlen > 0)
+                chunk_set_value_str(ck, c, col, row, vs, vlen);
         }
+        if (ck->fail) return;
     }
+}
+
+/* <dimension>: 1-based row count and 0-based max column, or -1 if absent */
+static void read_dimension(buf_t sheet, long *rows_out, int *cols_out)
+{
+    *rows_out = -1;
+    *cols_out = -1;
+    const char *end = sheet.p + sheet.n;
+    const char *p = find_tag(sheet.p, end, "<dimension");
+    if (!p) return;
+    attr_t a;
+    const char *q = p + 10;
+    const char *q2;
+    while ((q2 = next_attr(q, end, &a)) != NULL) {
+        if (attr_is(&a, "ref")) {
+            const char *colon = memchr(a.v, ':', (size_t)a.vlen);
+            if (colon) {
+                const char *r2 = colon + 1;
+                int len = (int)(a.v + a.vlen - r2);
+                int i = 0;
+                while (i < len && !(r2[i] >= '0' && r2[i] <= '9')) i++;
+                *rows_out = slice_long(r2 + i, len - i);
+                *cols_out = ref_col(r2, len);
+            }
+        }
+        q = q2;
+    }
+}
+
+static R_xlen_t *chunk_counts_alloc(void)
+{
+    R_xlen_t *counts =
+        (R_xlen_t *)scratch_alloc((size_t)MAX_COLS * 5 * sizeof(R_xlen_t));
+    memset(counts, 0, MAX_COLS * 5 * sizeof(R_xlen_t));
+    return counts;
+}
+
+static void chunk_init(chunk_t *ck, buf_t sheet, grid_t *g,
+                       const unsigned char *xf_date, int n_xf,
+                       const unsigned char *sst_blank, long n_sst)
+{
+    memset(ck, 0, sizeof *ck);
+    ck->begin = sheet.p;
+    ck->end = sheet.p + sheet.n;
+    ck->g = g;
+    ck->xf_date = xf_date;
+    ck->n_xf = n_xf;
+    ck->sst_blank = sst_blank;
+    ck->n_sst = n_sst;
+    ck->counts = chunk_counts_alloc();
+    ck->rmin = R_XLEN_T_MAX;
+    ck->rmax = -1;
+    ck->row_hi = -1;
+}
+
+static void merge_chunk(grid_t *g, const chunk_t *ck,
+                        unsigned char *sst_used, long n_sst)
+{
+    for (int j = 0; j < g->ncols; j++) {
+        col_t *c = &g->cols[j];
+        const R_xlen_t *ct = ck->counts + (size_t)j * 5;
+        c->nnum += ct[CNT_NUM];
+        c->ndate += ct[CNT_DATE];
+        c->nbool += ct[CNT_BOOL];
+        c->nstr += ct[CNT_STR];
+        c->nonblank += ct[CNT_NONBLANK];
+    }
+    if (ck->rmin < g->rmin) g->rmin = ck->rmin;
+    if (ck->rmax > g->rmax) g->rmax = ck->rmax;
+    if (sst_used && ck->sst_used && ck->sst_used != sst_used)
+        for (long i = 0; i < n_sst; i++)
+            sst_used[i] |= ck->sst_used[i];
+}
+
+static void parse_sheet_serial(buf_t sheet, grid_t *g,
+                               const unsigned char *xf_date, int n_xf,
+                               const unsigned char *sst_blank, long n_sst,
+                               unsigned char *sst_used)
+{
+    long dim_rows;
+    int dim_cols;
+    read_dimension(sheet, &dim_rows, &dim_cols);
+    if (dim_rows > 0) g->row_cap_hint = dim_rows;
+    if (dim_cols >= 0 && dim_cols < MAX_COLS) grid_ensure_col(g, dim_cols);
+
+    chunk_t ck;
+    chunk_init(&ck, sheet, g, xf_date, n_xf, sst_blank, n_sst);
+    ck.sst_used = sst_used;   /* serial: write the shared map directly */
+    ck.can_grow = 1;
+    parse_rows(&ck);
+    merge_chunk(g, &ck, NULL, 0);
+}
+
+static void *parse_rows_thread(void *arg)
+{
+    parse_rows((chunk_t *)arg);
+    return NULL;
+}
+
+/* Data-parallel parse: split at <row boundaries; every boundary row's r=
+   pins the disjoint 0-based row range each worker may write.  Workers touch
+   no R API.  Returns 1 on success, 0 to rerun serially (missing dimension
+   or r=, out-of-range rows, thread failure). */
+static int parse_sheet_mt(buf_t sheet, grid_t *g,
+                          const unsigned char *xf_date, int n_xf,
+                          const unsigned char *sst_blank, long n_sst,
+                          unsigned char *sst_used, int nthreads)
+{
+    const char *end = sheet.p + sheet.n;
+    long dim_rows;
+    int dim_cols;
+    read_dimension(sheet, &dim_rows, &dim_cols);
+    if (dim_rows <= 0 || dim_cols < 0 || dim_cols >= MAX_COLS) return 0;
+
+    const char *first = find_tag(sheet.p, end, "<row");
+    if (!first) {          /* no rows at all: nothing to parse */
+        g->row_cap_hint = dim_rows;
+        return 1;
+    }
+
+    /* pre-size the whole grid: workers cannot allocate */
+    g->row_cap_hint = dim_rows;
+    grid_ensure_col(g, dim_cols);
+    for (int j = 0; j < g->ncols; j++) {
+        col_t *c = &g->cols[j];
+        col_ensure_row(c, (R_xlen_t)dim_rows - 1, dim_rows);
+        if (!c->str)
+            c->str = (str_t *)scratch_alloc((size_t)c->cap * sizeof(str_t));
+    }
+
+    const char **bounds =
+        (const char **)scratch_alloc(((size_t)nthreads + 1) * sizeof(char *));
+    long *firstrow = (long *)scratch_alloc((size_t)nthreads * sizeof(long));
+    int used = 1;
+    bounds[0] = first;
+    for (int i = 1; i < nthreads; i++) {
+        const char *probe = sheet.p + ((size_t)sheet.n * (size_t)i) / (size_t)nthreads;
+        if (probe <= bounds[used - 1]) continue;
+        const char *b = find_tag(probe, end, "<row");
+        if (b && b > bounds[used - 1]) bounds[used++] = b;
+    }
+    bounds[used] = end;
+
+    for (int i = 0; i < used; i++) {
+        long rnum = -1;
+        attr_t a;
+        const char *q = bounds[i] + 4;
+        const char *q2;
+        while ((q2 = next_attr(q, bounds[i + 1], &a)) != NULL) {
+            if (attr_is(&a, "r")) rnum = slice_long(a.v, a.vlen);
+            q = q2;
+        }
+        if (rnum <= 0 || rnum > dim_rows) return 0;
+        firstrow[i] = rnum - 1;
+        if (i > 0 && firstrow[i] <= firstrow[i - 1]) return 0;
+    }
+
+    chunk_t *cks = (chunk_t *)scratch_alloc((size_t)used * sizeof(chunk_t));
+    for (int i = 0; i < used; i++) {
+        chunk_t *ck = &cks[i];
+        buf_t part;
+        part.p = (char *)bounds[i];
+        part.n = (size_t)(bounds[i + 1] - bounds[i]);
+        chunk_init(ck, part, g, xf_date, n_xf, sst_blank, n_sst);
+        if (n_sst) {
+            ck->sst_used = (unsigned char *)scratch_alloc((size_t)n_sst);
+            memset(ck->sst_used, 0, (size_t)n_sst);
+        }
+        ck->row_lo = firstrow[i];
+        ck->row_hi = i + 1 < used ? firstrow[i + 1] : dim_rows;
+    }
+
+    pthread_t *th = (pthread_t *)scratch_alloc((size_t)used * sizeof(pthread_t));
+    unsigned char *live = (unsigned char *)scratch_alloc((size_t)used);
+    memset(live, 0, (size_t)used);
+    for (int i = 1; i < used; i++)
+        live[i] = pthread_create(&th[i], NULL, parse_rows_thread, &cks[i]) == 0;
+    parse_rows(&cks[0]);
+    for (int i = 1; i < used; i++)
+        if (!live[i]) parse_rows(&cks[i]);   /* spawn failed: run inline */
+    for (int i = 1; i < used; i++)
+        if (live[i]) pthread_join(th[i], NULL);
+
+    for (int i = 0; i < used; i++)
+        if (cks[i].fail) return 0;
+    for (int i = 0; i < used; i++)
+        merge_chunk(g, &cks[i], sst_used, n_sst);
+    return 1;
+}
+
+/* worker count: RCXL_THREADS overrides; small sheets stay serial */
+static int rcxl_nthreads(size_t sheet_bytes)
+{
+    const char *e = getenv("RCXL_THREADS");
+    if (e && *e) {
+        long v = strtol(e, NULL, 10);
+        if (v >= 1) return v > 64 ? 64 : (int)v;
+    }
+    if (sheet_bytes < ((size_t)4 << 20)) return 1;
+    int n = xthread_ncores();
+    return n > 8 ? 8 : (n < 1 ? 1 : n);
 }
 
 
@@ -813,10 +1280,35 @@ static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_ss
         str_t s = trim ? str_trim(c->str[row]) : c->str[row];
         return mkCharLenCE(s.p, s.n, CE_UTF8);
     }
+    case CELL_STR_RAW:
+    case CELL_IS_RAW: {
+        /* deferred decode: entity-laden values and multi-run inline strings */
+        str_t raw = c->str[row];
+        str_t s = cell_tag(c, row) == CELL_STR_RAW
+                      ? xml_unescape(raw.p, raw.n)
+                      : collect_text(raw.p, raw.p + raw.n);
+        str_t st = str_trim(s);
+        if (st.n == 0) return NA_STRING;
+        if (trim) s = st;
+        return mkCharLenCE(s.p, s.n, CE_UTF8);
+    }
     case CELL_NUM:
-    case CELL_DATE:
-        snprintf(tmp, sizeof tmp, "%.15g", c->num[row]);
+    case CELL_DATE: {
+        /* integral values (the common stray-numeric-in-a-text-column case)
+           skip snprintf: emit digits directly */
+        double d = c->num[row];
+        if (d == floor(d) && fabs(d) <= 9007199254740992.0) {
+            long long v = (long long)d;
+            char *e = tmp + sizeof tmp, *s = e;
+            unsigned long long u = v < 0 ? 0ULL - (unsigned long long)v
+                                         : (unsigned long long)v;
+            do { *--s = (char)('0' + (int)(u % 10)); u /= 10; } while (u);
+            if (v < 0) *--s = '-';
+            return mkCharLenCE(s, (int)(e - s), CE_UTF8);
+        }
+        snprintf(tmp, sizeof tmp, "%.15g", d);
         return mkCharLenCE(tmp, (int)strlen(tmp), CE_UTF8);
+    }
     case CELL_BOOL:
         return mkCharLenCE(c->num[row] != 0.0 ? "TRUE" : "FALSE",
                            c->num[row] != 0.0 ? 4 : 5, CE_UTF8);
@@ -825,32 +1317,123 @@ static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_ss
     }
 }
 
+/* worksheet inflation job, so the sheet can decompress on a worker while
+   the main thread reads and parses styles and shared strings */
+typedef struct {
+    struct libdeflate_decompressor *infl;
+    const char *comp;
+    size_t comp_n;
+    char *out;
+    size_t out_n;
+    int method;
+    int ok;
+} infjob_t;
+
+static void *inflate_thread(void *arg)
+{
+    infjob_t *j = (infjob_t *)arg;
+    if (j->method == 0) {
+        if (j->comp_n >= j->out_n) {
+            memcpy(j->out, j->comp, j->out_n);
+            j->ok = 1;
+        }
+    } else {
+        size_t got = 0;
+        j->ok = libdeflate_deflate_decompress(j->infl, j->comp, j->comp_n,
+                                              j->out, j->out_n, &got)
+                    == LIBDEFLATE_SUCCESS && got == j->out_n;
+    }
+    return NULL;
+}
+
+/* column materialization: non-string columns are plain array fills with no
+   R API calls, so they can run on workers while the main thread interns
+   string columns */
+enum { FILL_REAL, FILL_DATE, FILL_LGL, FILL_NA };
+
+typedef struct {
+    const col_t *c;
+    double *dp;
+    int *lp;
+    R_xlen_t data0, r1;
+    int kind;
+    int date1904;
+    double epoch;
+} filljob_t;
+
+static void fill_one(const filljob_t *j)
+{
+    const col_t *c = j->c;
+    R_xlen_t data0 = j->data0, r1 = j->r1;
+    switch (j->kind) {
+    case FILL_REAL:
+        for (R_xlen_t r = data0; r < r1; r++) {
+            unsigned char tg = cell_tag(c, r);
+            j->dp[r - data0] = (tg == CELL_NUM || tg == CELL_DATE ||
+                                tg == CELL_BOOL)
+                                   ? c->num[r] : NA_REAL;
+        }
+        break;
+    case FILL_DATE:
+        for (R_xlen_t r = data0; r < r1; r++) {
+            if (cell_tag(c, r) != CELL_DATE) {
+                j->dp[r - data0] = NA_REAL;
+                continue;
+            }
+            double serial = c->num[r];
+            /* Excel's 1900 system counts a nonexistent 1900-02-29;
+               serials before it are one day behind the real calendar. */
+            if (!j->date1904 && serial < 61.0) serial += 1.0;
+            j->dp[r - data0] = (serial - j->epoch) * 86400.0;
+        }
+        break;
+    case FILL_LGL:
+        for (R_xlen_t r = data0; r < r1; r++)
+            j->lp[r - data0] = cell_tag(c, r) == CELL_BOOL
+                                   ? (c->num[r] != 0.0) : NA_LOGICAL;
+        break;
+    default:
+        for (R_xlen_t r = data0; r < r1; r++) j->lp[r - data0] = NA_LOGICAL;
+        break;
+    }
+}
+
+typedef struct {
+    const filljob_t *jobs;
+    int lo, hi;
+} fillspan_t;
+
+static void *fill_thread(void *arg)
+{
+    const fillspan_t *sp = (const fillspan_t *)arg;
+    for (int i = sp->lo; i < sp->hi; i++) fill_one(&sp->jobs[i]);
+    return NULL;
+}
+
 SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
 {
     const char *cpath = translateChar(STRING_ELT(path, 0));
     int want_names = asLogical(colNamesArg) == TRUE;
     int trim = asLogical(trimArg) == TRUE;
 
-    mz_zip_archive za;
-    memset(&za, 0, sizeof za);
-    if (!mz_zip_reader_init_file(&za, cpath, 0))
+    scratch_reset();
+    zipsrc_t za;
+    if (!zopen(&za, cpath))
         error("cannot open '%s' as a zip archive", cpath);
 
     buf_t wb = {NULL, 0}, rels = {NULL, 0}, sstbuf = {NULL, 0},
           sty = {NULL, 0}, sheet = {NULL, 0};
     if (!zread(&za, "xl/workbook.xml", &wb)) {
-        mz_zip_reader_end(&za);
+        zclose(&za);
         error("'%s' has no xl/workbook.xml; not an xlsx file", cpath);
     }
     zread(&za, "xl/_rels/workbook.xml.rels", &rels);
-    zread(&za, "xl/sharedStrings.xml", &sstbuf);
-    zread(&za, "xl/styles.xml", &sty);
 
     char rid[64];
     str_t sheet_name = {NULL, 0};
     long sheet_idx = wb_find_sheet(wb, sheetArg, rid, sizeof rid, &sheet_name);
     if (sheet_idx < 0) {
-        mz_zip_reader_end(&za);
+        zclose(&za);
         if (TYPEOF(sheetArg) == STRSXP)
             error("sheet '%s' not found", translateCharUTF8(STRING_ELT(sheetArg, 0)));
         error("sheet %d not found", asInteger(sheetArg));
@@ -859,79 +1442,102 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
     char target[512];
     if (!rels_target(rels, rid, target, sizeof target))
         snprintf(target, sizeof target, "xl/worksheets/sheet%ld.xml", sheet_idx);
-    if (!zread(&za, target, &sheet)) {
-        mz_zip_reader_end(&za);
+
+    /* kick off worksheet inflation, on a worker when the part is big enough:
+       the main thread reads and parses styles and shared strings meanwhile.
+       (An allocation failure in that window would longjmp past the join --
+       an accepted, OOM-only leak of the worker's target buffer.) */
+    infjob_t ij;
+    memset(&ij, 0, sizeof ij);
+    int sidx = mz_zip_reader_locate_file(&za.za, target, NULL, 0);
+    mz_zip_archive_file_stat shst;
+    if (sidx < 0 || !mz_zip_reader_file_stat(&za.za, (mz_uint)sidx, &shst) ||
+        !(ij.comp = zpayload(&za, &shst)) ||
+        (shst.m_method != 0 && shst.m_method != 8)) {
+        zclose(&za);
         error("cannot extract worksheet part '%s'", target);
     }
+    sheet.n = (size_t)shst.m_uncomp_size;
+    sheet.p = scratch_alloc(sheet.n + 1);
+    ij.comp_n = (size_t)shst.m_comp_size;
+    ij.out = sheet.p;
+    ij.out_n = sheet.n;
+    ij.method = (int)shst.m_method;
+    int inflating = 0;
+    pthread_t ith;
+    if (ij.method == 8 && ij.comp_n >= ((size_t)256 << 10) &&
+        rcxl_nthreads(sheet.n) > 1) {
+        struct libdeflate_options opt = {sizeof opt, ld_malloc, ld_free};
+        ij.infl = libdeflate_alloc_decompressor_ex(&opt);
+        if (ij.infl)
+            inflating = pthread_create(&ith, NULL, inflate_thread, &ij) == 0;
+    }
+    if (!inflating) {
+        ij.infl = za.infl;
+        inflate_thread(&ij);
+    }
+
+    zread(&za, "xl/sharedStrings.xml", &sstbuf);
+    zread(&za, "xl/styles.xml", &sty);
     int date1904 = wb_date1904(wb);
-    mz_zip_reader_end(&za);
 
     unsigned char *xf_date = NULL;
     int n_xf = 0;
     parse_styles(sty, &xf_date, &n_xf);
 
     str_t *sst = NULL;
+    unsigned char *sst_blank = NULL;
     long n_sst = 0;
-    parse_sst(sstbuf, &sst, &n_sst);
+    parse_sst(sstbuf, &sst, &n_sst, &sst_blank);
+    unsigned char *sst_used =
+        n_sst ? (unsigned char *)scratch_alloc((size_t)n_sst) : NULL;
+    if (sst_used) memset(sst_used, 0, (size_t)n_sst);
+
+    if (inflating) pthread_join(ith, NULL);
+    if (!ij.ok) {
+        zclose(&za);
+        error("cannot extract worksheet part '%s'", target);
+    }
+    sheet.p[sheet.n] = 0;
+    zclose(&za);
 
     grid_t g;
     memset(&g, 0, sizeof g);
-    parse_sheet(sheet, &g, xf_date, n_xf);
-
-    /* cells referencing empty/whitespace-only shared strings behave like
-       inline blanks; out-of-range references are treated the same way */
-    unsigned char *sst_blank =
-        n_sst ? (unsigned char *)R_alloc((size_t)n_sst, 1) : NULL;
-    for (long i = 0; i < n_sst; i++)
-        sst_blank[i] = !sst[i].p || str_trim(sst[i]).n == 0;
-    for (int j = 0; j < g.ncols; j++) {
-        col_t *c = &g.cols[j];
-        R_xlen_t rmax = c->cap < g.nrow ? c->cap : g.nrow;
-        for (R_xlen_t r = 0; r < rmax; r++)
-            if (c->tag[r] == CELL_SST) {
-                long i = (long)c->num[r];
-                if (i < 0 || i >= n_sst || sst_blank[i])
-                    c->tag[r] = CELL_EMPTY;
-            }
+    g.rmin = R_XLEN_T_MAX;
+    g.rmax = -1;
+    int nth = rcxl_nthreads(sheet.n);
+    int parsed = 0;
+    if (nth > 1) {
+        parsed = parse_sheet_mt(sheet, &g, xf_date, n_xf, sst_blank, n_sst,
+                                sst_used, nth);
+        if (!parsed) {   /* bail: reset and rerun serially */
+            memset(&g, 0, sizeof g);
+            g.rmin = R_XLEN_T_MAX;
+            g.rmax = -1;
+            if (sst_used) memset(sst_used, 0, (size_t)n_sst);
+        }
     }
+    if (!parsed)
+        parse_sheet_serial(sheet, &g, xf_date, n_xf, sst_blank, n_sst,
+                           sst_used);
 
+    /* only shared strings some cell actually references become CHARSXPs */
     SEXP sst_table = PROTECT(allocVector(STRSXP, n_sst));
     for (long i = 0; i < n_sst; i++) {
-        str_t s = sst[i];
-        if (trim && s.p) s = str_trim(s);
-        SET_STRING_ELT(sst_table, i,
-                       s.p ? mkCharLenCE(s.p, s.n, CE_UTF8) : mkCharLen("", 0));
+        if (!sst_used[i]) continue;
+        str_t s = trim ? str_trim(sst[i]) : sst[i];
+        SET_STRING_ELT(sst_table, i, mkCharLenCE(s.p, s.n, CE_UTF8));
     }
 
-    /* trim fully-blank edge rows and columns */
-    R_xlen_t r0 = 0, r1 = g.nrow;
-    int c0 = 0, c1 = g.ncols;
-    {
-        int found = 0;
-        for (; r0 < g.nrow && !found; )
-        {
-            for (int j = 0; j < g.ncols; j++)
-                if (cell_tag(&g.cols[j], r0) != CELL_BLANK) { found = 1; break; }
-            if (!found) r0++;
-        }
-        found = 0;
-        while (r1 > r0 && !found) {
-            for (int j = 0; j < g.ncols; j++)
-                if (cell_tag(&g.cols[j], r1 - 1) != CELL_BLANK) { found = 1; break; }
-            if (!found) r1--;
-        }
-        found = 0;
-        while (c0 < g.ncols && !found) {
-            for (R_xlen_t r = r0; r < r1; r++)
-                if (cell_tag(&g.cols[c0], r) != CELL_BLANK) { found = 1; break; }
-            if (!found) c0++;
-        }
-        found = 0;
-        while (c1 > c0 && !found) {
-            for (R_xlen_t r = r0; r < r1; r++)
-                if (cell_tag(&g.cols[c1 - 1], r) != CELL_BLANK) { found = 1; break; }
-            if (!found) c1--;
-        }
+    /* extent excluding fully-blank edge rows/columns, from parse-time tallies */
+    R_xlen_t r0 = 0, r1 = 0;
+    int c0 = 0, c1 = 0;
+    if (g.rmax >= 0) {
+        r0 = g.rmin;
+        r1 = g.rmax + 1;
+        c1 = g.ncols;
+        while (c0 < g.ncols && g.cols[c0].nonblank == 0) c0++;
+        while (c1 > c0 && g.cols[c1 - 1].nonblank == 0) c1--;
     }
 
     R_xlen_t data0 = want_names && r1 > r0 ? r0 + 1 : r0;
@@ -944,72 +1550,120 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
     SEXP nms = PROTECT(allocVector(STRSXP, nc));
     double epoch = date1904 ? 24107.0 : 25569.0;
 
+    filljob_t *jobs =
+        nc ? (filljob_t *)scratch_alloc((size_t)nc * sizeof(filljob_t)) : NULL;
+    int *strcol = nc ? (int *)scratch_alloc((size_t)nc * sizeof(int)) : NULL;
+    int *datecol = nc ? (int *)scratch_alloc((size_t)nc * sizeof(int)) : NULL;
+    int njobs = 0, nstrcols = 0, ndatecols = 0;
+
     for (int j = 0; j < nc; j++) {
         col_t *c = &g.cols[c0 + j];
-        R_xlen_t nnum = 0, ndate = 0, nbool = 0, nstr = 0;
-        for (R_xlen_t r = data0; r < r1; r++) {
-            switch (cell_tag(c, r)) {
-            case CELL_NUM:  nnum++; break;
-            case CELL_DATE: ndate++; break;
-            case CELL_BOOL: nbool++; break;
+        R_xlen_t nnum = c->nnum, ndate = c->ndate, nbool = c->nbool,
+                 nstr = c->nstr;
+        /* the header row is names, not data: back its cell out of the tallies */
+        if (data0 > r0) {
+            switch (cell_tag(c, r0)) {
+            case CELL_NUM:  nnum--; break;
+            case CELL_DATE: ndate--; break;
+            case CELL_BOOL: nbool--; break;
             case CELL_SST:
-            case CELL_STR:  nstr++; break;
+            case CELL_STR:
+            case CELL_STR_RAW:
+            case CELL_IS_RAW: nstr--; break;
             default: break;
             }
         }
 
         SEXP col;
+        filljob_t *fj = NULL;
         if (nstr > 0) {
             col = allocVector(STRSXP, n);
             SET_VECTOR_ELT(ans, j, col);
-            for (R_xlen_t r = data0; r < r1; r++)
-                SET_STRING_ELT(col, r - data0,
-                               cell_charsxp(c, r, sst_table, n_sst, trim));
+            strcol[nstrcols++] = j;
         } else if (nbool > 0 && nnum == 0 && ndate == 0) {
             col = allocVector(LGLSXP, n);
             SET_VECTOR_ELT(ans, j, col);
-            int *lp = LOGICAL(col);
-            for (R_xlen_t r = data0; r < r1; r++)
-                lp[r - data0] = cell_tag(c, r) == CELL_BOOL
-                                    ? (c->num[r] != 0.0) : NA_LOGICAL;
+            fj = &jobs[njobs++];
+            fj->kind = FILL_LGL;
+            fj->lp = LOGICAL(col);
         } else if (ndate > 0 && nnum == 0) {
             col = allocVector(REALSXP, n);
             SET_VECTOR_ELT(ans, j, col);
-            double *dp = REAL(col);
-            for (R_xlen_t r = data0; r < r1; r++) {
-                if (cell_tag(c, r) != CELL_DATE) {
-                    dp[r - data0] = NA_REAL;
-                    continue;
-                }
-                double serial = c->num[r];
-                /* Excel's 1900 system counts a nonexistent 1900-02-29;
-                   serials before it are one day behind the real calendar. */
-                if (!date1904 && serial < 61.0) serial += 1.0;
-                dp[r - data0] = (serial - epoch) * 86400.0;
-            }
-            SEXP kl = PROTECT(allocVector(STRSXP, 2));
-            SET_STRING_ELT(kl, 0, mkChar("POSIXct"));
-            SET_STRING_ELT(kl, 1, mkChar("POSIXt"));
-            setAttrib(col, R_ClassSymbol, kl);
-            setAttrib(col, install("tzone"), mkString("UTC"));
-            UNPROTECT(1);
+            fj = &jobs[njobs++];
+            fj->kind = FILL_DATE;
+            fj->dp = REAL(col);
+            datecol[ndatecols++] = j;
         } else if (nnum > 0 || ndate > 0 || nbool > 0) {
             col = allocVector(REALSXP, n);
             SET_VECTOR_ELT(ans, j, col);
-            double *dp = REAL(col);
-            for (R_xlen_t r = data0; r < r1; r++) {
-                unsigned char tg = cell_tag(c, r);
-                dp[r - data0] = (tg == CELL_NUM || tg == CELL_DATE ||
-                                 tg == CELL_BOOL)
-                                    ? c->num[r] : NA_REAL;
-            }
+            fj = &jobs[njobs++];
+            fj->kind = FILL_REAL;
+            fj->dp = REAL(col);
         } else {
             col = allocVector(LGLSXP, n);
             SET_VECTOR_ELT(ans, j, col);
-            int *lp = LOGICAL(col);
-            for (R_xlen_t r = 0; r < n; r++) lp[r] = NA_LOGICAL;
+            fj = &jobs[njobs++];
+            fj->kind = FILL_NA;
+            fj->lp = LOGICAL(col);
         }
+        if (fj) {
+            fj->c = c;
+            fj->data0 = data0;
+            fj->r1 = r1;
+            fj->date1904 = date1904;
+            fj->epoch = epoch;
+        }
+    }
 
+    /* array fills run on workers while the main thread interns strings */
+    pthread_t fth[8];
+    fillspan_t spans[8];
+    int nworkers = 0;
+    if (nth > 1 && njobs > 0 && n > 0) {
+        int want = nth - 1;
+        if (want > njobs) want = njobs;
+        if (want > 8) want = 8;
+        for (int i = 0; i < want; i++) {
+            spans[i].jobs = jobs;
+            spans[i].lo = (int)((long long)njobs * i / want);
+            spans[i].hi = (int)((long long)njobs * (i + 1) / want);
+            if (pthread_create(&fth[nworkers], NULL, fill_thread, &spans[i]) == 0)
+                nworkers++;
+            else
+                fill_thread(&spans[i]);
+        }
+    } else {
+        for (int i = 0; i < njobs; i++) fill_one(&jobs[i]);
+    }
+
+    for (int si = 0; si < nstrcols; si++) {
+        int j = strcol[si];
+        SEXP col = VECTOR_ELT(ans, j);
+        col_t *c = &g.cols[c0 + j];
+        for (R_xlen_t r = data0; r < r1; r++) {
+            /* SST is the hot case; indices were validated at parse time */
+            if (cell_tag(c, r) == CELL_SST)
+                SET_STRING_ELT(col, r - data0,
+                               STRING_ELT(sst_table, (R_xlen_t)c->num[r]));
+            else
+                SET_STRING_ELT(col, r - data0,
+                               cell_charsxp(c, r, sst_table, n_sst, trim));
+        }
+    }
+
+    for (int i = 0; i < nworkers; i++) pthread_join(fth[i], NULL);
+
+    for (int di = 0; di < ndatecols; di++) {
+        SEXP col = VECTOR_ELT(ans, datecol[di]);
+        SEXP kl = PROTECT(allocVector(STRSXP, 2));
+        SET_STRING_ELT(kl, 0, mkChar("POSIXct"));
+        SET_STRING_ELT(kl, 1, mkChar("POSIXt"));
+        setAttrib(col, R_ClassSymbol, kl);
+        setAttrib(col, install("tzone"), mkString("UTC"));
+        UNPROTECT(1);
+    }
+
+    for (int j = 0; j < nc; j++) {
         if (want_names && r1 > r0) {
             SEXP nm = cell_charsxp(&g.cols[c0 + j], r0, sst_table, n_sst, trim);
             if (nm == NA_STRING) {
@@ -1033,16 +1687,16 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
 SEXP C_sheet_names(SEXP path)
 {
     const char *cpath = translateChar(STRING_ELT(path, 0));
-    mz_zip_archive za;
-    memset(&za, 0, sizeof za);
-    if (!mz_zip_reader_init_file(&za, cpath, 0))
+    scratch_reset();
+    zipsrc_t za;
+    if (!zopen(&za, cpath))
         error("cannot open '%s' as a zip archive", cpath);
     buf_t wb = {NULL, 0};
     if (!zread(&za, "xl/workbook.xml", &wb)) {
-        mz_zip_reader_end(&za);
+        zclose(&za);
         error("'%s' has no xl/workbook.xml; not an xlsx file", cpath);
     }
-    mz_zip_reader_end(&za);
+    zclose(&za);
 
     const char *end = wb.p + wb.n;
     long count = 0;
