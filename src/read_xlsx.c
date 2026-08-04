@@ -542,18 +542,12 @@ static void parse_sst(buf_t sst, str_t **out, long *n_out, unsigned char **blank
 }
 
 
-static long wb_find_sheet(buf_t wb, SEXP sheetArg, char *rid, size_t rid_cap,
-                          str_t *name_out)
+/* one of want_name / want_idx (1-based workbook position) selects the sheet */
+static long wb_sheet_lookup(buf_t wb, const char *want_name, long want_idx,
+                            char *rid, size_t rid_cap, str_t *name_out)
 {
     const char *end = wb.p + wb.n;
     const char *p = wb.p;
-    const char *want_name = NULL;
-    long want_idx = -1;
-    if (TYPEOF(sheetArg) == STRSXP)
-        want_name = translateCharUTF8(STRING_ELT(sheetArg, 0));
-    else
-        want_idx = asInteger(sheetArg);
-
     long idx = 0;
     while ((p = find_tag(p, end, "<sheet")) != NULL) {
         p += 6;
@@ -586,6 +580,15 @@ static long wb_find_sheet(buf_t wb, SEXP sheetArg, char *rid, size_t rid_cap,
         }
     }
     return -1;
+}
+
+static long wb_sheet_count(buf_t wb)
+{
+    const char *end = wb.p + wb.n;
+    long n = 0;
+    const char *p = wb.p;
+    while ((p = find_tag(p, end, "<sheet")) != NULL) { n++; p += 6; }
+    return n;
 }
 
 static int wb_date1904(buf_t wb)
@@ -638,6 +641,44 @@ static int rels_target(buf_t rels, const char *rid, char *out, size_t out_cap)
         }
     }
     return 0;
+}
+
+
+/* workbook-level state shared by every sheet read in one call: the zip
+   source plus the parsed workbook, relationships, styles, and SST */
+typedef struct {
+    zipsrc_t za;
+    buf_t wb, rels;
+    unsigned char *xf_date;
+    int n_xf;
+    str_t *sst;
+    unsigned char *sst_blank;
+    long n_sst;
+    int date1904;
+} wb_t;
+
+static void wb_open(wb_t *w, const char *cpath)
+{
+    memset(w, 0, sizeof *w);
+    scratch_reset();
+    if (!zopen(&w->za, cpath))
+        error("cannot open '%s' as a zip archive", cpath);
+    if (!zread(&w->za, "xl/workbook.xml", &w->wb)) {
+        zclose(&w->za);
+        error("'%s' has no xl/workbook.xml; not an xlsx file", cpath);
+    }
+    zread(&w->za, "xl/_rels/workbook.xml.rels", &w->rels);
+}
+
+/* separate from wb_open so the first worksheet's inflation can overlap it */
+static void wb_meta(wb_t *w)
+{
+    buf_t sstbuf = {NULL, 0}, sty = {NULL, 0};
+    zread(&w->za, "xl/sharedStrings.xml", &sstbuf);
+    zread(&w->za, "xl/styles.xml", &sty);
+    w->date1904 = wb_date1904(w->wb);
+    parse_styles(sty, &w->xf_date, &w->n_xf);
+    parse_sst(sstbuf, &w->sst, &w->n_sst, &w->sst_blank);
 }
 
 
@@ -1346,6 +1387,51 @@ static void *inflate_thread(void *arg)
     return NULL;
 }
 
+/* Locate a worksheet part and start inflating it, on a worker only when
+   allow_thread and the part is big enough to pay for the spawn.  Without a
+   worker the buffer is ready on return; either way sheet_extract_finish
+   must run before *out is used.  Returns 0 if the part is missing. */
+static int sheet_extract_start(wb_t *w, const char *target, infjob_t *ij,
+                               buf_t *out, pthread_t *th, int *spawned,
+                               int allow_thread)
+{
+    memset(ij, 0, sizeof *ij);
+    *spawned = 0;
+    int sidx = mz_zip_reader_locate_file(&w->za.za, target, NULL, 0);
+    mz_zip_archive_file_stat st;
+    if (sidx < 0 || !mz_zip_reader_file_stat(&w->za.za, (mz_uint)sidx, &st) ||
+        !(ij->comp = zpayload(&w->za, &st)) ||
+        (st.m_method != 0 && st.m_method != 8))
+        return 0;
+    out->n = (size_t)st.m_uncomp_size;
+    out->p = scratch_alloc(out->n + 1);
+    ij->comp_n = (size_t)st.m_comp_size;
+    ij->out = out->p;
+    ij->out_n = out->n;
+    ij->method = (int)st.m_method;
+    if (allow_thread && ij->method == 8 && ij->comp_n >= ((size_t)256 << 10) &&
+        rcxl_nthreads(out->n) > 1) {
+        struct libdeflate_options opt = {sizeof opt, ld_malloc, ld_free};
+        ij->infl = libdeflate_alloc_decompressor_ex(&opt);
+        if (ij->infl)
+            *spawned = pthread_create(th, NULL, inflate_thread, ij) == 0;
+    }
+    if (!*spawned) {
+        ij->infl = w->za.infl;
+        inflate_thread(ij);
+    }
+    return 1;
+}
+
+static int sheet_extract_finish(infjob_t *ij, buf_t *out, pthread_t *th,
+                                int spawned)
+{
+    if (spawned) pthread_join(*th, NULL);
+    if (!ij->ok) return 0;
+    out->p[out->n] = 0;
+    return 1;
+}
+
 /* column materialization: non-string columns are plain array fills with no
    R API calls, so they can run on workers while the main thread interns
    string columns */
@@ -1410,96 +1496,19 @@ static void *fill_thread(void *arg)
     return NULL;
 }
 
-SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
+/* parse one extracted worksheet and materialize it as a named column list;
+   sst_table/sst_interned accumulate interned shared strings across sheets */
+static SEXP sheet_to_df(wb_t *w, buf_t sheet, int want_names, int trim,
+                        SEXP sst_table, unsigned char *sst_interned)
 {
-    const char *cpath = translateChar(STRING_ELT(path, 0));
-    int want_names = asLogical(colNamesArg) == TRUE;
-    int trim = asLogical(trimArg) == TRUE;
-
-    scratch_reset();
-    zipsrc_t za;
-    if (!zopen(&za, cpath))
-        error("cannot open '%s' as a zip archive", cpath);
-
-    buf_t wb = {NULL, 0}, rels = {NULL, 0}, sstbuf = {NULL, 0},
-          sty = {NULL, 0}, sheet = {NULL, 0};
-    if (!zread(&za, "xl/workbook.xml", &wb)) {
-        zclose(&za);
-        error("'%s' has no xl/workbook.xml; not an xlsx file", cpath);
-    }
-    zread(&za, "xl/_rels/workbook.xml.rels", &rels);
-
-    char rid[64];
-    str_t sheet_name = {NULL, 0};
-    long sheet_idx = wb_find_sheet(wb, sheetArg, rid, sizeof rid, &sheet_name);
-    if (sheet_idx < 0) {
-        zclose(&za);
-        if (TYPEOF(sheetArg) == STRSXP)
-            error("sheet '%s' not found", translateCharUTF8(STRING_ELT(sheetArg, 0)));
-        error("sheet %d not found", asInteger(sheetArg));
-    }
-
-    char target[512];
-    if (!rels_target(rels, rid, target, sizeof target))
-        snprintf(target, sizeof target, "xl/worksheets/sheet%ld.xml", sheet_idx);
-
-    /* kick off worksheet inflation, on a worker when the part is big enough:
-       the main thread reads and parses styles and shared strings meanwhile.
-       (An allocation failure in that window would longjmp past the join --
-       an accepted, OOM-only leak of the worker's target buffer.) */
-    infjob_t ij;
-    memset(&ij, 0, sizeof ij);
-    int sidx = mz_zip_reader_locate_file(&za.za, target, NULL, 0);
-    mz_zip_archive_file_stat shst;
-    if (sidx < 0 || !mz_zip_reader_file_stat(&za.za, (mz_uint)sidx, &shst) ||
-        !(ij.comp = zpayload(&za, &shst)) ||
-        (shst.m_method != 0 && shst.m_method != 8)) {
-        zclose(&za);
-        error("cannot extract worksheet part '%s'", target);
-    }
-    sheet.n = (size_t)shst.m_uncomp_size;
-    sheet.p = scratch_alloc(sheet.n + 1);
-    ij.comp_n = (size_t)shst.m_comp_size;
-    ij.out = sheet.p;
-    ij.out_n = sheet.n;
-    ij.method = (int)shst.m_method;
-    int inflating = 0;
-    pthread_t ith;
-    if (ij.method == 8 && ij.comp_n >= ((size_t)256 << 10) &&
-        rcxl_nthreads(sheet.n) > 1) {
-        struct libdeflate_options opt = {sizeof opt, ld_malloc, ld_free};
-        ij.infl = libdeflate_alloc_decompressor_ex(&opt);
-        if (ij.infl)
-            inflating = pthread_create(&ith, NULL, inflate_thread, &ij) == 0;
-    }
-    if (!inflating) {
-        ij.infl = za.infl;
-        inflate_thread(&ij);
-    }
-
-    zread(&za, "xl/sharedStrings.xml", &sstbuf);
-    zread(&za, "xl/styles.xml", &sty);
-    int date1904 = wb_date1904(wb);
-
-    unsigned char *xf_date = NULL;
-    int n_xf = 0;
-    parse_styles(sty, &xf_date, &n_xf);
-
-    str_t *sst = NULL;
-    unsigned char *sst_blank = NULL;
-    long n_sst = 0;
-    parse_sst(sstbuf, &sst, &n_sst, &sst_blank);
+    const unsigned char *xf_date = w->xf_date;
+    int n_xf = w->n_xf;
+    const unsigned char *sst_blank = w->sst_blank;
+    long n_sst = w->n_sst;
+    int date1904 = w->date1904;
     unsigned char *sst_used =
         n_sst ? (unsigned char *)scratch_alloc((size_t)n_sst) : NULL;
     if (sst_used) memset(sst_used, 0, (size_t)n_sst);
-
-    if (inflating) pthread_join(ith, NULL);
-    if (!ij.ok) {
-        zclose(&za);
-        error("cannot extract worksheet part '%s'", target);
-    }
-    sheet.p[sheet.n] = 0;
-    zclose(&za);
 
     grid_t g;
     memset(&g, 0, sizeof g);
@@ -1521,12 +1530,13 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
         parse_sheet_serial(sheet, &g, xf_date, n_xf, sst_blank, n_sst,
                            sst_used);
 
-    /* only shared strings some cell actually references become CHARSXPs */
-    SEXP sst_table = PROTECT(allocVector(STRSXP, n_sst));
+    /* only shared strings some cell actually references become CHARSXPs;
+       entries interned for an earlier sheet are reused as-is */
     for (long i = 0; i < n_sst; i++) {
-        if (!sst_used[i]) continue;
-        str_t s = trim ? str_trim(sst[i]) : sst[i];
+        if (!sst_used[i] || sst_interned[i]) continue;
+        str_t s = trim ? str_trim(w->sst[i]) : w->sst[i];
         SET_STRING_ELT(sst_table, i, mkCharLenCE(s.p, s.n, CE_UTF8));
+        sst_interned[i] = 1;
     }
 
     /* extent excluding fully-blank edge rows/columns, from parse-time tallies */
@@ -1680,8 +1690,114 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
     }
 
     setAttrib(ans, R_NamesSymbol, nms);
-    UNPROTECT(3);
+    UNPROTECT(2);
     return ans;
+}
+
+/* Shared driver: resolve the requested sheets (R_NilValue = every sheet, in
+   workbook order), extract them while workbook metadata parses, then
+   materialize each.  Returns a list named by actual sheet names. */
+static SEXP read_impl(const char *cpath, SEXP sheetsArg, int want_names,
+                      int trim)
+{
+    wb_t w;
+    wb_open(&w, cpath);
+
+    R_xlen_t nsel = sheetsArg == R_NilValue ? (R_xlen_t)wb_sheet_count(w.wb)
+                                            : XLENGTH(sheetsArg);
+    char *targets = nsel ? (char *)scratch_alloc((size_t)nsel * 512) : NULL;
+    str_t *names =
+        nsel ? (str_t *)scratch_alloc((size_t)nsel * sizeof(str_t)) : NULL;
+    for (R_xlen_t i = 0; i < nsel; i++) {
+        const char *want_name = NULL;
+        long want_idx = -1;
+        if (sheetsArg == R_NilValue)
+            want_idx = (long)i + 1;
+        else if (TYPEOF(sheetsArg) == STRSXP)
+            want_name = translateCharUTF8(STRING_ELT(sheetsArg, i));
+        else
+            want_idx = INTEGER(sheetsArg)[i];
+        char rid[64];
+        long idx = wb_sheet_lookup(w.wb, want_name, want_idx, rid, sizeof rid,
+                                   &names[i]);
+        if (idx < 0) {
+            zclose(&w.za);
+            if (want_name) error("sheet '%s' not found", want_name);
+            error("sheet %ld not found", want_idx);
+        }
+        char *target = targets + (size_t)i * 512;
+        if (!rels_target(w.rels, rid, target, 512))
+            snprintf(target, 512, "xl/worksheets/sheet%ld.xml", idx);
+    }
+
+    /* the first sheet inflates on a worker while metadata parses; the rest
+       extract inline afterwards.  (An allocation failure in that window
+       would longjmp past the join -- an accepted, OOM-only leak of the
+       worker's target buffer.) */
+    buf_t *sheets =
+        nsel ? (buf_t *)scratch_alloc((size_t)nsel * sizeof(buf_t)) : NULL;
+    infjob_t ij;
+    pthread_t ith;
+    int spawned = 0;
+    const char *fail = NULL;
+    if (nsel > 0 &&
+        !sheet_extract_start(&w, targets, &ij, &sheets[0], &ith, &spawned, 1))
+        fail = targets;
+    wb_meta(&w);
+    for (R_xlen_t i = 1; !fail && i < nsel; i++) {
+        infjob_t ij2;
+        pthread_t th2;
+        int sp2;
+        if (!sheet_extract_start(&w, targets + (size_t)i * 512, &ij2,
+                                 &sheets[i], &th2, &sp2, 0) ||
+            !sheet_extract_finish(&ij2, &sheets[i], &th2, sp2))
+            fail = targets + (size_t)i * 512;
+    }
+    if (nsel > 0 && !fail &&
+        !sheet_extract_finish(&ij, &sheets[0], &ith, spawned))
+        fail = targets;
+    else if (spawned && fail)
+        pthread_join(ith, NULL);
+    zclose(&w.za);
+    if (fail) error("cannot extract worksheet part '%s'", fail);
+
+    SEXP sst_table = PROTECT(allocVector(STRSXP, w.n_sst));
+    unsigned char *interned =
+        w.n_sst ? (unsigned char *)scratch_alloc((size_t)w.n_sst) : NULL;
+    if (interned) memset(interned, 0, (size_t)w.n_sst);
+
+    SEXP out = PROTECT(allocVector(VECSXP, nsel));
+    SEXP onms = PROTECT(allocVector(STRSXP, nsel));
+    for (R_xlen_t i = 0; i < nsel; i++) {
+        str_t dec = xml_unescape(names[i].p, names[i].n);
+        SET_STRING_ELT(onms, i, mkCharLenCE(dec.p, dec.n, CE_UTF8));
+    }
+    for (R_xlen_t i = 0; i < nsel; i++)
+        SET_VECTOR_ELT(out, i,
+                       sheet_to_df(&w, sheets[i], want_names, trim, sst_table,
+                                   interned));
+    setAttrib(out, R_NamesSymbol, onms);
+    UNPROTECT(3);
+    return out;
+}
+
+SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
+{
+    const char *cpath = translateChar(STRING_ELT(path, 0));
+    if (XLENGTH(sheetArg) != 1) error("'sheet' must select a single sheet");
+    SEXP out = PROTECT(read_impl(cpath, sheetArg,
+                                 asLogical(colNamesArg) == TRUE,
+                                 asLogical(trimArg) == TRUE));
+    SEXP ans = VECTOR_ELT(out, 0);
+    UNPROTECT(1);
+    return ans;
+}
+
+SEXP C_read_xlsx_all(SEXP path, SEXP sheetsArg, SEXP colNamesArg, SEXP trimArg)
+{
+    const char *cpath = translateChar(STRING_ELT(path, 0));
+    return read_impl(cpath, sheetsArg, asLogical(colNamesArg) == TRUE,
+                     asLogical(trimArg) == TRUE);
 }
 
 SEXP C_sheet_names(SEXP path)

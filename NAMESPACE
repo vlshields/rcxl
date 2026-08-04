@@ -1,3 +1,4 @@
 useDynLib(rcxl, .registration = TRUE)
 export(read_xlsx)
+export(read_xlsx_all)
 export(xlsx_sheets)

@@ -3,11 +3,13 @@
 #include <R_ext/Rdynload.h>
 
 SEXP C_read_xlsx(SEXP path, SEXP sheet, SEXP col_names, SEXP trim_ws);
+SEXP C_read_xlsx_all(SEXP path, SEXP sheets, SEXP col_names, SEXP trim_ws);
 SEXP C_sheet_names(SEXP path);
 
 static const R_CallMethodDef call_entries[] = {
-    {"C_read_xlsx",   (DL_FUNC) &C_read_xlsx,   4},
-    {"C_sheet_names", (DL_FUNC) &C_sheet_names, 1},
+    {"C_read_xlsx",     (DL_FUNC) &C_read_xlsx,     4},
+    {"C_read_xlsx_all", (DL_FUNC) &C_read_xlsx_all, 4},
+    {"C_sheet_names",   (DL_FUNC) &C_sheet_names,   1},
     {NULL, NULL, 0}
 };
 
