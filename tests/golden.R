@@ -100,5 +100,74 @@ if (requireNamespace("readxl", quietly = TRUE)) {
   }
 } else cat("note: readxl not available; skipping cross-check\n")
 
+## ---- 4. range / skip / n_max --------------------------------------------
+
+if (requireNamespace("readxl", quietly = TRUE)) {
+  # value parity ignoring naming conventions (rcxl V1 vs readxl ...1) and
+  # readxl's millisecond rounding of POSIXct
+  cmp_df <- function(a, b, what) {
+    check(identical(dim(a), dim(b)), paste(what, "dims"))
+    if (!identical(dim(a), dim(b))) return(invisible())
+    for (j in seq_along(a)) {
+      x <- a[[j]]; y <- b[[j]]
+      check(identical(inherits(x, "POSIXct"), inherits(y, "POSIXct")),
+            paste0(what, "[", j, "] date typing"))
+      if (inherits(x, "POSIXct")) { x <- as.numeric(x); y <- as.numeric(y) }
+      if (is.numeric(x) && is.numeric(y)) {
+        check(isTRUE(all.equal(x, y, tolerance = 1e-6)), paste0(what, "[", j, "] values"))
+      } else
+        check(identical(as.character(x), as.character(y)), paste0(what, "[", j, "] values"))
+    }
+  }
+  rdx <- function(...) as.data.frame(suppressMessages(
+    readxl::read_excel(..., progress = FALSE)))
+  lim <- cellranger::cell_limits
+
+  m <- fx("mixed")
+  cmp_df(read_xlsx(m, range = "B3:D10"), rdx(m, range = "B3:D10"), "range rect")
+  cmp_df(read_xlsx(m, skip = 5), rdx(m, skip = 5), "skip")
+  cmp_df(read_xlsx(m, n_max = 7), rdx(m, n_max = 7), "n_max")
+  cmp_df(read_xlsx(m, n_max = 0), rdx(m, n_max = 0), "n_max=0")
+  cmp_df(read_xlsx(m, skip = 3, n_max = 5, col_names = FALSE),
+         rdx(m, skip = 3, n_max = 5, col_names = FALSE), "skip+n_max")
+  cmp_df(read_xlsx(m, range = "B:C"),
+         rdx(m, range = lim(c(NA, 2), c(NA, 3))), "col-only range")
+  cmp_df(read_xlsx(m, range = "3:10", col_names = FALSE),
+         rdx(m, range = lim(c(3, NA), c(10, NA)), col_names = FALSE),
+         "row-only range")
+  cmp_df(read_xlsx(m, range = "B3"), rdx(m, range = "B3"), "single cell")
+
+  t <- fx("tiny")
+  cmp_df(read_xlsx(t, range = "A99:C110"), rdx(t, range = "A99:C110"),
+         "range past rows")
+  cmp_df(read_xlsx(t, range = "A99:E103"), rdx(t, range = "A99:E103"),
+         "range past cols")
+  # divergence from readxl: a range with no data at all keeps its rectangle
+  # (all NA) where readxl collapses to 0x0
+  pd <- read_xlsx(t, range = "A200:C205")
+  check(identical(dim(pd), c(5L, 3L)) &&
+          all(vapply(pd, function(x) all(is.na(x)), TRUE)),
+        "fully-past-data range keeps its rectangle")
+
+  ms <- fx("multisheet")
+  check(read_xlsx(ms, range = "Beta!A1:A2")$x == 2, "sheet-qualified range")
+  check(read_xlsx(ms, range = "'Beta'!A1:A2")$x == 2, "quoted sheet range")
+
+  e <- fx("edge")
+  cmp_df(read_xlsx(e, range = "F2:F4"), rdx(e, range = "F2:F4"),
+         "date typing through range")
+
+  al <- read_xlsx_all(ms, skip = 1, col_names = FALSE)
+  check(all(vapply(al, nrow, 0L) == 1) && al$Beta[[1]] == 2,
+        "read_xlsx_all skip")
+
+  check(inherits(try(read_xlsx(m, range = "banana"), silent = TRUE), "try-error"),
+        "malformed range errors")
+  check(inherits(try(read_xlsx(m, skip = -1), silent = TRUE), "try-error"),
+        "negative skip errors")
+  check(inherits(try(read_xlsx(m, range = "A1:ZZZ9"), silent = TRUE), "try-error"),
+        "out-of-limit column errors")
+} else cat("note: readxl not available; skipping range/skip/n_max checks\n")
+
 if (fails > 0L) stop(fails, " golden check(s) failed")
 cat("all golden checks passed\n")

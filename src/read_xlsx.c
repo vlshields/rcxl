@@ -826,6 +826,19 @@ static int parse_num_fast(const char *s, int n, double *out)
     return 1;
 }
 
+/* Cell window from the R-level range/skip/n_max arguments.  Cells outside
+   [r0,r1) x [c0,c1) are filtered at parse time (negative r1/c1 leaves that
+   side open) and the grid is indexed relative to (r0,c0).  A fixed axis
+   materializes the window's exact span instead of the trimmed data extent,
+   so a range keeps its blank rows and columns. */
+typedef struct {
+    long r0, r1;
+    int c0, c1;
+    int fixed_r, fixed_c;
+    R_xlen_t n_max;   /* cap on data rows when rows are not fixed; < 0 = none */
+} win_t;
+
+
 /* ---- sheet parsing ----
    The row loop is chunk-based so it can run serially over the whole buffer
    or data-parallel over disjoint row ranges.  Unless ck->can_grow (serial
@@ -852,6 +865,8 @@ typedef struct {
     R_xlen_t *counts;          /* chunk-private, [MAX_COLS * 5] */
     R_xlen_t rmin, rmax;
     long row_lo, row_hi;       /* allowed 0-based rows [lo,hi); hi<0: open */
+    long flt_lo, flt_hi;       /* window rows [lo,hi); hi<0: open */
+    int flt_c0, flt_c1;        /* window cols [c0,c1); c1<0: open */
     int can_grow;              /* serial mode: may allocate through R */
     int fail;                  /* threaded bail: rerun serially */
 } chunk_t;
@@ -939,7 +954,17 @@ static void parse_rows(chunk_t *ck)
             ck->fail = 1;
             return;
         }
-        R_xlen_t row = (R_xlen_t)cur_row;
+        int rskip = cur_row < ck->flt_lo ||
+                    (ck->flt_hi >= 0 && cur_row >= ck->flt_hi);
+        if (rskip && !ck->can_grow) {
+            /* threaded mode already assumes ascending rows, so past the
+               window means done; hopping rows by tag is safe because a
+               false "<row" match has no valid r= and fails into the
+               serial path, which walks every cell instead */
+            if (ck->flt_hi >= 0 && cur_row >= ck->flt_hi) break;
+            continue;
+        }
+        R_xlen_t row = (R_xlen_t)(cur_row - ck->flt_lo);
         if (self) continue;
 
         int last_col = -1;
@@ -982,15 +1007,22 @@ static void parse_rows(chunk_t *ck)
             p = tag_close(q, end, &self);
             if (col < 0) col = last_col + 1;
             last_col = col;
-            if (col >= MAX_COLS) continue;
-            if (col >= g->ncols) {
-                if (!ck->can_grow) { ck->fail = 1; return; }
-                grid_ensure_col(g, col);
-            }
-            col_t *c = &g->cols[col];
-            if (row >= c->cap) {
-                if (!ck->can_grow) { ck->fail = 1; return; }
-                col_ensure_row(c, row, g->row_cap_hint);
+            /* filtered cells are still walked to </c> so the scan stays
+               aligned; only the stores are suppressed */
+            int crel = col - ck->flt_c0;
+            int cskip = rskip || crel < 0 || crel >= MAX_COLS ||
+                        (ck->flt_c1 >= 0 && col >= ck->flt_c1);
+            col_t *c = NULL;
+            if (!cskip) {
+                if (crel >= g->ncols) {
+                    if (!ck->can_grow) { ck->fail = 1; return; }
+                    grid_ensure_col(g, crel);
+                }
+                c = &g->cols[crel];
+                if (row >= c->cap) {
+                    if (!ck->can_grow) { ck->fail = 1; return; }
+                    col_ensure_row(c, row, g->row_cap_hint);
+                }
             }
             if (self) continue;
 
@@ -998,16 +1030,16 @@ static void parse_rows(chunk_t *ck)
                 const char *cend = sfind(p, end, "</c>");
                 if (!cend) cend = end;
                 const char *is = find_tag(p, cend, "<is");
-                if (is) {
+                if (is && !cskip) {
                     int s2;
                     const char *body = tag_close(is + 3, cend, &s2);
                     if (!s2) {
                         str_t s;
                         if (inline_zero_copy(body, cend, &s))
-                            chunk_set_str(ck, c, col, row, s, CELL_STR);
+                            chunk_set_str(ck, c, crel, row, s, CELL_STR);
                         else {
                             str_t raw = {body, (int)(cend - body)};
-                            chunk_set_str(ck, c, col, row, raw, CELL_IS_RAW);
+                            chunk_set_str(ck, c, crel, row, raw, CELL_IS_RAW);
                         }
                     }
                 }
@@ -1051,26 +1083,27 @@ static void parse_rows(chunk_t *ck)
             if (end - p >= 4 && p[0] == '<' && p[1] == '/' && p[2] == 'c' &&
                 p[3] == '>')
                 p += 4;   /* skip </c> here rather than re-scanning it */
+            if (cskip) continue;
 
             if (t == 's') {
                 long i = slice_long(vs, vlen);
-                chunk_extent(ck, col, row);
+                chunk_extent(ck, crel, row);
                 if (i < 0 || i >= ck->n_sst || ck->sst_blank[i]) {
                     c->tag[row] = CELL_EMPTY;
                 } else {
                     c->tag[row] = CELL_SST;
                     c->num[row] = (double)i;
-                    ck->counts[col * 5 + CNT_STR]++;
+                    ck->counts[crel * 5 + CNT_STR]++;
                     ck->sst_used[i] = 1;
                 }
             } else if (t == 'b') {
-                chunk_extent(ck, col, row);
+                chunk_extent(ck, crel, row);
                 c->tag[row] = CELL_BOOL;
                 c->num[row] = (vlen > 0 && (vs[0] == '1' || vs[0] == 't'))
                                   ? 1.0 : 0.0;
-                ck->counts[col * 5 + CNT_BOOL]++;
+                ck->counts[crel * 5 + CNT_BOOL]++;
             } else if (t == 'r' || t == 'd') {
-                chunk_set_value_str(ck, c, col, row, vs, vlen);
+                chunk_set_value_str(ck, c, crel, row, vs, vlen);
             } else if (vlen > 0 && vlen < 64) {
                 double d;
                 int ok = parse_num_fast(vs, vlen, &d);
@@ -1087,19 +1120,19 @@ static void parse_rows(chunk_t *ck)
                 if (ok) {
                     int isdate = style >= 0 && style < ck->n_xf &&
                                  ck->xf_date[style];
-                    chunk_extent(ck, col, row);
+                    chunk_extent(ck, crel, row);
                     if (isdate) {
                         c->tag[row] = CELL_DATE;
-                        ck->counts[col * 5 + CNT_DATE]++;
+                        ck->counts[crel * 5 + CNT_DATE]++;
                     } else {
                         c->tag[row] = CELL_NUM;
-                        ck->counts[col * 5 + CNT_NUM]++;
+                        ck->counts[crel * 5 + CNT_NUM]++;
                     }
                     c->num[row] = d;
                 } else
-                    chunk_set_value_str(ck, c, col, row, vs, vlen);
+                    chunk_set_value_str(ck, c, crel, row, vs, vlen);
             } else if (vlen > 0)
-                chunk_set_value_str(ck, c, col, row, vs, vlen);
+                chunk_set_value_str(ck, c, crel, row, vs, vlen);
         }
         if (ck->fail) return;
     }
@@ -1140,7 +1173,7 @@ static R_xlen_t *chunk_counts_alloc(void)
     return counts;
 }
 
-static void chunk_init(chunk_t *ck, buf_t sheet, grid_t *g,
+static void chunk_init(chunk_t *ck, buf_t sheet, grid_t *g, const win_t *win,
                        const unsigned char *xf_date, int n_xf,
                        const unsigned char *sst_blank, long n_sst)
 {
@@ -1156,6 +1189,10 @@ static void chunk_init(chunk_t *ck, buf_t sheet, grid_t *g,
     ck->rmin = R_XLEN_T_MAX;
     ck->rmax = -1;
     ck->row_hi = -1;
+    ck->flt_lo = win->r0;
+    ck->flt_hi = win->r1;
+    ck->flt_c0 = win->c0;
+    ck->flt_c1 = win->c1;
 }
 
 static void merge_chunk(grid_t *g, const chunk_t *ck,
@@ -1177,7 +1214,18 @@ static void merge_chunk(grid_t *g, const chunk_t *ck,
             sst_used[i] |= ck->sst_used[i];
 }
 
-static void parse_sheet_serial(buf_t sheet, grid_t *g,
+/* window intersected with the sheet dimension, in window-relative units:
+   number of rows the grid can receive and the highest relative column */
+static void win_dims(const win_t *win, long dim_rows, int dim_cols,
+                     long *rows_out, int *cmax_out)
+{
+    long hi = win->r1 >= 0 && win->r1 < dim_rows ? win->r1 : dim_rows;
+    *rows_out = hi - win->r0;
+    int cmax = win->c1 >= 0 && win->c1 - 1 < dim_cols ? win->c1 - 1 : dim_cols;
+    *cmax_out = cmax - win->c0;
+}
+
+static void parse_sheet_serial(buf_t sheet, grid_t *g, const win_t *win,
                                const unsigned char *xf_date, int n_xf,
                                const unsigned char *sst_blank, long n_sst,
                                unsigned char *sst_used)
@@ -1185,11 +1233,15 @@ static void parse_sheet_serial(buf_t sheet, grid_t *g,
     long dim_rows;
     int dim_cols;
     read_dimension(sheet, &dim_rows, &dim_cols);
-    if (dim_rows > 0) g->row_cap_hint = dim_rows;
-    if (dim_cols >= 0 && dim_cols < MAX_COLS) grid_ensure_col(g, dim_cols);
+    long win_rows;
+    int crel_max;
+    win_dims(win, dim_rows, dim_cols, &win_rows, &crel_max);
+    if (dim_rows > 0 && win_rows > 0) g->row_cap_hint = win_rows;
+    if (dim_cols >= 0 && crel_max >= 0 && crel_max < MAX_COLS)
+        grid_ensure_col(g, crel_max);
 
     chunk_t ck;
-    chunk_init(&ck, sheet, g, xf_date, n_xf, sst_blank, n_sst);
+    chunk_init(&ck, sheet, g, win, xf_date, n_xf, sst_blank, n_sst);
     ck.sst_used = sst_used;   /* serial: write the shared map directly */
     ck.can_grow = 1;
     parse_rows(&ck);
@@ -1206,7 +1258,7 @@ static void *parse_rows_thread(void *arg)
    pins the disjoint 0-based row range each worker may write.  Workers touch
    no R API.  Returns 1 on success, 0 to rerun serially (missing dimension
    or r=, out-of-range rows, thread failure). */
-static int parse_sheet_mt(buf_t sheet, grid_t *g,
+static int parse_sheet_mt(buf_t sheet, grid_t *g, const win_t *win,
                           const unsigned char *xf_date, int n_xf,
                           const unsigned char *sst_blank, long n_sst,
                           unsigned char *sst_used, int nthreads)
@@ -1216,19 +1268,24 @@ static int parse_sheet_mt(buf_t sheet, grid_t *g,
     int dim_cols;
     read_dimension(sheet, &dim_rows, &dim_cols);
     if (dim_rows <= 0 || dim_cols < 0 || dim_cols >= MAX_COLS) return 0;
+    long win_rows;
+    int crel_max;
+    win_dims(win, dim_rows, dim_cols, &win_rows, &crel_max);
+    /* window past the dimension: dimensions lie, let the serial pass look */
+    if (win_rows <= 0) return 0;
 
     const char *first = find_tag(sheet.p, end, "<row");
     if (!first) {          /* no rows at all: nothing to parse */
-        g->row_cap_hint = dim_rows;
+        g->row_cap_hint = win_rows;
         return 1;
     }
 
     /* pre-size the whole grid: workers cannot allocate */
-    g->row_cap_hint = dim_rows;
-    grid_ensure_col(g, dim_cols);
+    g->row_cap_hint = win_rows;
+    if (crel_max >= 0) grid_ensure_col(g, crel_max);
     for (int j = 0; j < g->ncols; j++) {
         col_t *c = &g->cols[j];
-        col_ensure_row(c, (R_xlen_t)dim_rows - 1, dim_rows);
+        col_ensure_row(c, (R_xlen_t)win_rows - 1, win_rows);
         if (!c->str)
             c->str = (str_t *)scratch_alloc((size_t)c->cap * sizeof(str_t));
     }
@@ -1266,7 +1323,7 @@ static int parse_sheet_mt(buf_t sheet, grid_t *g,
         buf_t part;
         part.p = (char *)bounds[i];
         part.n = (size_t)(bounds[i + 1] - bounds[i]);
-        chunk_init(ck, part, g, xf_date, n_xf, sst_blank, n_sst);
+        chunk_init(ck, part, g, win, xf_date, n_xf, sst_blank, n_sst);
         if (n_sst) {
             ck->sst_used = (unsigned char *)scratch_alloc((size_t)n_sst);
             memset(ck->sst_used, 0, (size_t)n_sst);
@@ -1498,8 +1555,8 @@ static void *fill_thread(void *arg)
 
 /* parse one extracted worksheet and materialize it as a named column list;
    sst_table/sst_interned accumulate interned shared strings across sheets */
-static SEXP sheet_to_df(wb_t *w, buf_t sheet, int want_names, int trim,
-                        SEXP sst_table, unsigned char *sst_interned)
+static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
+                        int trim, SEXP sst_table, unsigned char *sst_interned)
 {
     const unsigned char *xf_date = w->xf_date;
     int n_xf = w->n_xf;
@@ -1517,8 +1574,8 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, int want_names, int trim,
     int nth = rcxl_nthreads(sheet.n);
     int parsed = 0;
     if (nth > 1) {
-        parsed = parse_sheet_mt(sheet, &g, xf_date, n_xf, sst_blank, n_sst,
-                                sst_used, nth);
+        parsed = parse_sheet_mt(sheet, &g, win, xf_date, n_xf, sst_blank,
+                                n_sst, sst_used, nth);
         if (!parsed) {   /* bail: reset and rerun serially */
             memset(&g, 0, sizeof g);
             g.rmin = R_XLEN_T_MAX;
@@ -1527,7 +1584,7 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, int want_names, int trim,
         }
     }
     if (!parsed)
-        parse_sheet_serial(sheet, &g, xf_date, n_xf, sst_blank, n_sst,
+        parse_sheet_serial(sheet, &g, win, xf_date, n_xf, sst_blank, n_sst,
                            sst_used);
 
     /* only shared strings some cell actually references become CHARSXPs;
@@ -1549,9 +1606,26 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, int want_names, int trim,
         while (c0 < g.ncols && g.cols[c0].nonblank == 0) c0++;
         while (c1 > c0 && g.cols[c1 - 1].nonblank == 0) c1--;
     }
+    /* a fixed axis keeps the window's exact span, blank edges included */
+    if (win->fixed_r) {
+        r0 = 0;
+        r1 = (R_xlen_t)(win->r1 - win->r0);
+    }
+    if (win->fixed_c) {
+        c0 = 0;
+        c1 = win->c1 - win->c0;
+        if (c1 > MAX_COLS) c1 = MAX_COLS;
+        if (c1 > g.ncols) grid_ensure_col(&g, c1 - 1);
+    }
 
     R_xlen_t data0 = want_names && r1 > r0 ? r0 + 1 : r0;
     R_xlen_t n = r1 - data0;
+    int capped = 0;
+    if (!win->fixed_r && win->n_max >= 0 && n > win->n_max) {
+        n = win->n_max;
+        r1 = data0 + n;
+        capped = 1;
+    }
     int nc = c1 - c0;
     if (nc < 0) nc = 0;
     if (n < 0) n = 0;
@@ -1568,19 +1642,41 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, int want_names, int trim,
 
     for (int j = 0; j < nc; j++) {
         col_t *c = &g.cols[c0 + j];
-        R_xlen_t nnum = c->nnum, ndate = c->ndate, nbool = c->nbool,
-                 nstr = c->nstr;
-        /* the header row is names, not data: back its cell out of the tallies */
-        if (data0 > r0) {
-            switch (cell_tag(c, r0)) {
-            case CELL_NUM:  nnum--; break;
-            case CELL_DATE: ndate--; break;
-            case CELL_BOOL: nbool--; break;
-            case CELL_SST:
-            case CELL_STR:
-            case CELL_STR_RAW:
-            case CELL_IS_RAW: nstr--; break;
-            default: break;
+        R_xlen_t nnum, ndate, nbool, nstr;
+        if (capped) {
+            /* n_max cut rows the tallies already counted; retally the kept
+               span so typing reflects only the rows returned */
+            nnum = ndate = nbool = nstr = 0;
+            for (R_xlen_t r = data0; r < r1; r++) {
+                switch (cell_tag(c, r)) {
+                case CELL_NUM:  nnum++; break;
+                case CELL_DATE: ndate++; break;
+                case CELL_BOOL: nbool++; break;
+                case CELL_SST:
+                case CELL_STR:
+                case CELL_STR_RAW:
+                case CELL_IS_RAW: nstr++; break;
+                default: break;
+                }
+            }
+        } else {
+            nnum = c->nnum;
+            ndate = c->ndate;
+            nbool = c->nbool;
+            nstr = c->nstr;
+            /* the header row is names, not data: back its cell out of the
+               tallies */
+            if (data0 > r0) {
+                switch (cell_tag(c, r0)) {
+                case CELL_NUM:  nnum--; break;
+                case CELL_DATE: ndate--; break;
+                case CELL_BOOL: nbool--; break;
+                case CELL_SST:
+                case CELL_STR:
+                case CELL_STR_RAW:
+                case CELL_IS_RAW: nstr--; break;
+                default: break;
+                }
             }
         }
 
@@ -1698,7 +1794,7 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, int want_names, int trim,
    workbook order), extract them while workbook metadata parses, then
    materialize each.  Returns a list named by actual sheet names. */
 static SEXP read_impl(const char *cpath, SEXP sheetsArg, int want_names,
-                      int trim)
+                      int trim, const win_t *win)
 {
     wb_t w;
     wb_open(&w, cpath);
@@ -1774,30 +1870,50 @@ static SEXP read_impl(const char *cpath, SEXP sheetsArg, int want_names,
     }
     for (R_xlen_t i = 0; i < nsel; i++)
         SET_VECTOR_ELT(out, i,
-                       sheet_to_df(&w, sheets[i], want_names, trim, sst_table,
-                                   interned));
+                       sheet_to_df(&w, sheets[i], win, want_names, trim,
+                                   sst_table, interned));
     setAttrib(out, R_NamesSymbol, onms);
     UNPROTECT(3);
     return out;
 }
 
-SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg)
+/* {r0, r1, c0, c1, fixed_r, fixed_c, n_max} built by the R wrappers */
+static win_t win_decode(SEXP w)
+{
+    if (TYPEOF(w) != INTSXP || XLENGTH(w) != 7) error("invalid window");
+    const int *v = INTEGER(w);
+    win_t win;
+    win.r0 = v[0];
+    win.r1 = v[1];
+    win.c0 = v[2];
+    win.c1 = v[3];
+    win.fixed_r = v[4];
+    win.fixed_c = v[5];
+    win.n_max = v[6];
+    return win;
+}
+
+SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg,
+                 SEXP winArg)
 {
     const char *cpath = translateChar(STRING_ELT(path, 0));
     if (XLENGTH(sheetArg) != 1) error("'sheet' must select a single sheet");
+    win_t win = win_decode(winArg);
     SEXP out = PROTECT(read_impl(cpath, sheetArg,
                                  asLogical(colNamesArg) == TRUE,
-                                 asLogical(trimArg) == TRUE));
+                                 asLogical(trimArg) == TRUE, &win));
     SEXP ans = VECTOR_ELT(out, 0);
     UNPROTECT(1);
     return ans;
 }
 
-SEXP C_read_xlsx_all(SEXP path, SEXP sheetsArg, SEXP colNamesArg, SEXP trimArg)
+SEXP C_read_xlsx_all(SEXP path, SEXP sheetsArg, SEXP colNamesArg, SEXP trimArg,
+                     SEXP winArg)
 {
     const char *cpath = translateChar(STRING_ELT(path, 0));
+    win_t win = win_decode(winArg);
     return read_impl(cpath, sheetsArg, asLogical(colNamesArg) == TRUE,
-                     asLogical(trimArg) == TRUE);
+                     asLogical(trimArg) == TRUE, &win);
 }
 
 SEXP C_sheet_names(SEXP path)
