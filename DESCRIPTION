@@ -10,3 +10,4 @@ Description: Reads tabular data from 'xlsx' files with a specialized C parser.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Depends: R (>= 4.0)
+Suggests: readxl

@@ -1,0 +1,4 @@
+^tools$
+^\.gitignore$
+^.*\.o$
+^src/.*\.so$
