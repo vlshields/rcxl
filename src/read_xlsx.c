@@ -695,6 +695,17 @@ enum {
     CELL_IS_RAW  /* <is> body slice; runs collected at materialization */
 };
 
+/* per-column type overrides; order matches the R-side name vector */
+enum {
+    COL_GUESS = 0,
+    COL_SKIP,
+    COL_LGL,
+    COL_NUM,
+    COL_DATE,
+    COL_TEXT,
+    COL_LIST
+};
+
 typedef struct {
     unsigned char *tag;
     double *num;
@@ -1415,6 +1426,203 @@ static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_ss
     }
 }
 
+/* decoded text of a string-bearing cell; 0 for every other tag */
+static int cell_str_slice(const wb_t *w, const col_t *c, R_xlen_t r,
+                          unsigned char tg, str_t *out)
+{
+    switch (tg) {
+    case CELL_SST: {
+        long i = (long)c->num[r];
+        if (i < 0 || i >= w->n_sst) return 0;
+        *out = w->sst[i];
+        return 1;
+    }
+    case CELL_STR:
+        *out = c->str[r];
+        return 1;
+    case CELL_STR_RAW: {
+        str_t raw = c->str[r];
+        *out = xml_unescape(raw.p, raw.n);
+        return 1;
+    }
+    case CELL_IS_RAW: {
+        str_t raw = c->str[r];
+        *out = collect_text(raw.p, raw.p + raw.n);
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
+static int parse_num_any(str_t s, double *out)
+{
+    if (s.n <= 0) return 0;
+    if (parse_num_fast(s.p, s.n, out)) return 1;
+    char sbuf[64];
+    char *nb = s.n < 64 ? sbuf : R_alloc((size_t)s.n + 1, 1);
+    memcpy(nb, s.p, (size_t)s.n);
+    nb[s.n] = 0;
+    char *ep = NULL;
+    double d = strtod(nb, &ep);
+    if (!ep || ep == nb || *ep != 0) return 0;
+    *out = d;
+    return 1;
+}
+
+/* case-insensitive TRUE/FALSE/T/F, the values as.logical accepts */
+static int parse_lgl_str(str_t s, int *out)
+{
+    char b[5];
+    if (s.n < 1 || s.n > 5) return 0;
+    for (int i = 0; i < s.n; i++) {
+        char ch = s.p[i];
+        b[i] = ch >= 'A' && ch <= 'Z' ? (char)(ch + 32) : ch;
+    }
+    if ((s.n == 4 && memcmp(b, "true", 4) == 0) || (s.n == 1 && b[0] == 't')) {
+        *out = 1;
+        return 1;
+    }
+    if ((s.n == 5 && memcmp(b, "false", 5) == 0) || (s.n == 1 && b[0] == 'f')) {
+        *out = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* 0-based column and 1-based row -> "BC12" */
+static void a1_ref(int col0, long row1, char *buf, size_t cap)
+{
+    char tmp[8];
+    int n = 0;
+    long c = col0 + 1;
+    while (c > 0 && n < 7) {
+        tmp[n++] = (char)('A' + (int)((c - 1) % 26));
+        c = (c - 1) / 26;
+    }
+    size_t i = 0;
+    while (n > 0 && i + 1 < cap) buf[i++] = tmp[--n];
+    snprintf(buf + i, cap - i, "%ld", row1);
+}
+
+/* Forced-type columns holding string cells, and every "list" column, fill
+   here on the main thread: string decoding may allocate through R.  Clean
+   coercions are silent; only cells lost to NA count as failures. */
+static void force_col_main(const wb_t *w, SEXP col, const col_t *c, int t,
+                           R_xlen_t data0, R_xlen_t r1, int date1904,
+                           double epoch, int trim, SEXP sst_table, SEXP dklass,
+                           SEXP tz, R_xlen_t *nfail, R_xlen_t *ffail)
+{
+    double *dp = t == COL_NUM || t == COL_DATE ? REAL(col) : NULL;
+    int *lp = t == COL_LGL ? LOGICAL(col) : NULL;
+    for (R_xlen_t r = data0; r < r1; r++) {
+        /* per-cell string decoding R_allocs scratch that would otherwise
+           pile up until the .Call returns; reclaim it every iteration */
+        const void *vmax = vmaxget();
+        R_xlen_t i = r - data0;
+        unsigned char tg = cell_tag(c, r);
+        if (t == COL_LIST) {
+            SEXP v;
+            switch (tg) {
+            case CELL_NUM:
+                v = ScalarReal(c->num[r]);
+                break;
+            case CELL_DATE: {
+                double serial = c->num[r];
+                if (!date1904 && serial < 61.0) serial += 1.0;
+                v = PROTECT(ScalarReal((serial - epoch) * 86400.0));
+                setAttrib(v, R_ClassSymbol, dklass);
+                setAttrib(v, install("tzone"), tz);
+                UNPROTECT(1);
+                break;
+            }
+            case CELL_BOOL:
+                v = ScalarLogical(c->num[r] != 0.0);
+                break;
+            case CELL_SST:
+            case CELL_STR:
+            case CELL_STR_RAW:
+            case CELL_IS_RAW: {
+                SEXP cs = PROTECT(cell_charsxp(c, r, sst_table, w->n_sst,
+                                               trim));
+                v = cs == NA_STRING ? ScalarLogical(NA_LOGICAL)
+                                    : ScalarString(cs);
+                UNPROTECT(1);
+                break;
+            }
+            default:
+                v = ScalarLogical(NA_LOGICAL);
+                break;
+            }
+            SET_VECTOR_ELT(col, i, v);
+            vmaxset(vmax);
+            continue;
+        }
+        str_t s;
+        int fail = 0;
+        switch (t) {
+        case COL_NUM:
+            if (tg == CELL_NUM || tg == CELL_DATE || tg == CELL_BOOL)
+                dp[i] = c->num[r];
+            else if (cell_str_slice(w, c, r, tg, &s)) {
+                double d;
+                s = str_trim(s);
+                if (parse_num_any(s, &d))
+                    dp[i] = d;
+                else {
+                    dp[i] = NA_REAL;
+                    fail = s.n > 0;
+                }
+            } else
+                dp[i] = NA_REAL;
+            break;
+        case COL_LGL:
+            if (tg == CELL_BOOL || tg == CELL_NUM)
+                lp[i] = c->num[r] != 0.0;
+            else if (tg == CELL_DATE) {
+                lp[i] = NA_LOGICAL;
+                fail = 1;
+            } else if (cell_str_slice(w, c, r, tg, &s)) {
+                int b;
+                s = str_trim(s);
+                if (s.n == 0)
+                    lp[i] = NA_LOGICAL;
+                else if (parse_lgl_str(s, &b))
+                    lp[i] = b;
+                else {
+                    lp[i] = NA_LOGICAL;
+                    fail = 1;
+                }
+            } else
+                lp[i] = NA_LOGICAL;
+            break;
+        default:   /* COL_DATE; strings never parse as dates */
+            /* Excel has no negative serials; such values are not dates */
+            if ((tg == CELL_DATE || tg == CELL_NUM) && c->num[r] >= 0.0) {
+                double serial = c->num[r];
+                if (!date1904 && serial < 61.0) serial += 1.0;
+                dp[i] = (serial - epoch) * 86400.0;
+            } else if (tg == CELL_NUM || tg == CELL_DATE) {
+                dp[i] = NA_REAL;
+                fail = 1;
+            } else if (tg == CELL_BOOL) {
+                dp[i] = NA_REAL;
+                fail = 1;
+            } else if (cell_str_slice(w, c, r, tg, &s)) {
+                dp[i] = NA_REAL;
+                fail = str_trim(s).n > 0;
+            } else
+                dp[i] = NA_REAL;
+            break;
+        }
+        if (fail) {
+            (*nfail)++;
+            if (*ffail < 0) *ffail = r;
+        }
+        vmaxset(vmax);
+    }
+}
+
 /* worksheet inflation job, so the sheet can decompress on a worker while
    the main thread reads and parses styles and shared strings */
 typedef struct {
@@ -1492,7 +1700,8 @@ static int sheet_extract_finish(infjob_t *ij, buf_t *out, pthread_t *th,
 /* column materialization: non-string columns are plain array fills with no
    R API calls, so they can run on workers while the main thread interns
    string columns */
-enum { FILL_REAL, FILL_DATE, FILL_LGL, FILL_NA };
+enum { FILL_REAL, FILL_DATE, FILL_LGL, FILL_NA, FILL_LGL_FORCE,
+       FILL_DATE_FORCE };
 
 typedef struct {
     const col_t *c;
@@ -1502,7 +1711,15 @@ typedef struct {
     int kind;
     int date1904;
     double epoch;
+    /* coercion failures under a forced type; each job owns its slots */
+    R_xlen_t *nfailp, *ffailp;
 } filljob_t;
+
+static void fill_fail(const filljob_t *j, R_xlen_t r)
+{
+    (*j->nfailp)++;
+    if (*j->ffailp < 0) *j->ffailp = r;
+}
 
 static void fill_one(const filljob_t *j)
 {
@@ -1535,6 +1752,32 @@ static void fill_one(const filljob_t *j)
             j->lp[r - data0] = cell_tag(c, r) == CELL_BOOL
                                    ? (c->num[r] != 0.0) : NA_LOGICAL;
         break;
+    case FILL_LGL_FORCE:
+        for (R_xlen_t r = data0; r < r1; r++) {
+            unsigned char tg = cell_tag(c, r);
+            if (tg == CELL_BOOL || tg == CELL_NUM)
+                j->lp[r - data0] = c->num[r] != 0.0;
+            else {
+                j->lp[r - data0] = NA_LOGICAL;
+                if (tg == CELL_DATE) fill_fail(j, r);
+            }
+        }
+        break;
+    case FILL_DATE_FORCE:
+        for (R_xlen_t r = data0; r < r1; r++) {
+            unsigned char tg = cell_tag(c, r);
+            /* Excel has no negative serials; such values are not dates */
+            if ((tg == CELL_DATE || tg == CELL_NUM) && c->num[r] >= 0.0) {
+                double serial = c->num[r];
+                if (!j->date1904 && serial < 61.0) serial += 1.0;
+                j->dp[r - data0] = (serial - j->epoch) * 86400.0;
+            } else {
+                j->dp[r - data0] = NA_REAL;
+                if (tg == CELL_BOOL || tg == CELL_NUM || tg == CELL_DATE)
+                    fill_fail(j, r);
+            }
+        }
+        break;
     default:
         for (R_xlen_t r = data0; r < r1; r++) j->lp[r - data0] = NA_LOGICAL;
         break;
@@ -1556,7 +1799,8 @@ static void *fill_thread(void *arg)
 /* parse one extracted worksheet and materialize it as a named column list;
    sst_table/sst_interned accumulate interned shared strings across sheets */
 static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
-                        int trim, SEXP sst_table, unsigned char *sst_interned)
+                        int trim, SEXP ctypesArg, SEXP sst_table,
+                        unsigned char *sst_interned)
 {
     const unsigned char *xf_date = w->xf_date;
     int n_xf = w->n_xf;
@@ -1630,17 +1874,47 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
     if (nc < 0) nc = 0;
     if (n < 0) n = 0;
 
-    SEXP ans = PROTECT(allocVector(VECSXP, nc));
-    SEXP nms = PROTECT(allocVector(STRSXP, nc));
+    /* per-column type overrides: a scalar recycles, otherwise one entry per
+       materialized column; "skip" entries count here and are dropped below */
+    int *typ = nc ? (int *)scratch_alloc((size_t)nc * sizeof(int)) : NULL;
+    {
+        R_xlen_t nct = ctypesArg == R_NilValue ? 0 : XLENGTH(ctypesArg);
+        const int *ctv = nct ? INTEGER(ctypesArg) : NULL;
+        if (nct > 1 && nct != nc)
+            error("'col_types' has length %lld but the sheet has %d column%s",
+                  (long long)nct, nc, nc == 1 ? "" : "s");
+        for (int j = 0; j < nc; j++) {
+            int t = ctv ? ctv[nct == 1 ? 0 : j] : COL_GUESS;
+            if (t < COL_GUESS || t > COL_LIST)
+                error("invalid 'col_types' code %d", t);
+            typ[j] = t;
+        }
+    }
+    int out_nc = 0;
+    for (int j = 0; j < nc; j++) out_nc += typ[j] != COL_SKIP;
+
+    SEXP ans = PROTECT(allocVector(VECSXP, out_nc));
+    SEXP nms = PROTECT(allocVector(STRSXP, out_nc));
     double epoch = date1904 ? 24107.0 : 25569.0;
 
-    filljob_t *jobs =
-        nc ? (filljob_t *)scratch_alloc((size_t)nc * sizeof(filljob_t)) : NULL;
-    int *strcol = nc ? (int *)scratch_alloc((size_t)nc * sizeof(int)) : NULL;
-    int *datecol = nc ? (int *)scratch_alloc((size_t)nc * sizeof(int)) : NULL;
-    int njobs = 0, nstrcols = 0, ndatecols = 0;
+    filljob_t *jobs = out_nc
+        ? (filljob_t *)scratch_alloc((size_t)out_nc * sizeof(filljob_t)) : NULL;
+    int *strcol =
+        out_nc ? (int *)scratch_alloc((size_t)out_nc * sizeof(int)) : NULL;
+    int *datecol =
+        out_nc ? (int *)scratch_alloc((size_t)out_nc * sizeof(int)) : NULL;
+    int *convcol =
+        out_nc ? (int *)scratch_alloc((size_t)out_nc * sizeof(int)) : NULL;
+    int *src =   /* output slot -> materialized column offset */
+        out_nc ? (int *)scratch_alloc((size_t)out_nc * sizeof(int)) : NULL;
+    R_xlen_t *nfail = out_nc
+        ? (R_xlen_t *)scratch_alloc((size_t)out_nc * sizeof(R_xlen_t)) : NULL;
+    R_xlen_t *ffail = out_nc
+        ? (R_xlen_t *)scratch_alloc((size_t)out_nc * sizeof(R_xlen_t)) : NULL;
+    int njobs = 0, nstrcols = 0, ndatecols = 0, nconvcols = 0;
 
-    for (int j = 0; j < nc; j++) {
+    for (int j = 0, oj = 0; j < nc; j++) {
+        if (typ[j] == COL_SKIP) continue;
         col_t *c = &g.cols[c0 + j];
         R_xlen_t nnum, ndate, nbool, nstr;
         if (capped) {
@@ -1680,34 +1954,56 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
             }
         }
 
+        src[oj] = j;
+        nfail[oj] = 0;
+        ffail[oj] = -1;
+        int t = typ[j];
         SEXP col;
         filljob_t *fj = NULL;
-        if (nstr > 0) {
+        if (t == COL_TEXT || (t == COL_GUESS && nstr > 0)) {
             col = allocVector(STRSXP, n);
-            SET_VECTOR_ELT(ans, j, col);
-            strcol[nstrcols++] = j;
+            SET_VECTOR_ELT(ans, oj, col);
+            strcol[nstrcols++] = oj;
+        } else if (t == COL_LIST) {
+            col = allocVector(VECSXP, n);
+            SET_VECTOR_ELT(ans, oj, col);
+            convcol[nconvcols++] = oj;
+        } else if (t != COL_GUESS) {
+            col = allocVector(t == COL_LGL ? LGLSXP : REALSXP, n);
+            SET_VECTOR_ELT(ans, oj, col);
+            if (t == COL_DATE) datecol[ndatecols++] = oj;
+            if (nstr > 0)
+                convcol[nconvcols++] = oj;
+            else {
+                fj = &jobs[njobs++];
+                fj->kind = t == COL_LGL    ? FILL_LGL_FORCE
+                           : t == COL_DATE ? FILL_DATE_FORCE
+                                           : FILL_REAL;
+                if (t == COL_LGL) fj->lp = LOGICAL(col);
+                else fj->dp = REAL(col);
+            }
         } else if (nbool > 0 && nnum == 0 && ndate == 0) {
             col = allocVector(LGLSXP, n);
-            SET_VECTOR_ELT(ans, j, col);
+            SET_VECTOR_ELT(ans, oj, col);
             fj = &jobs[njobs++];
             fj->kind = FILL_LGL;
             fj->lp = LOGICAL(col);
         } else if (ndate > 0 && nnum == 0) {
             col = allocVector(REALSXP, n);
-            SET_VECTOR_ELT(ans, j, col);
+            SET_VECTOR_ELT(ans, oj, col);
             fj = &jobs[njobs++];
             fj->kind = FILL_DATE;
             fj->dp = REAL(col);
-            datecol[ndatecols++] = j;
+            datecol[ndatecols++] = oj;
         } else if (nnum > 0 || ndate > 0 || nbool > 0) {
             col = allocVector(REALSXP, n);
-            SET_VECTOR_ELT(ans, j, col);
+            SET_VECTOR_ELT(ans, oj, col);
             fj = &jobs[njobs++];
             fj->kind = FILL_REAL;
             fj->dp = REAL(col);
         } else {
             col = allocVector(LGLSXP, n);
-            SET_VECTOR_ELT(ans, j, col);
+            SET_VECTOR_ELT(ans, oj, col);
             fj = &jobs[njobs++];
             fj->kind = FILL_NA;
             fj->lp = LOGICAL(col);
@@ -1718,7 +2014,10 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
             fj->r1 = r1;
             fj->date1904 = date1904;
             fj->epoch = epoch;
+            fj->nfailp = &nfail[oj];
+            fj->ffailp = &ffail[oj];
         }
+        oj++;
     }
 
     /* array fills run on workers while the main thread interns strings */
@@ -1743,9 +2042,9 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
     }
 
     for (int si = 0; si < nstrcols; si++) {
-        int j = strcol[si];
-        SEXP col = VECTOR_ELT(ans, j);
-        col_t *c = &g.cols[c0 + j];
+        int oj = strcol[si];
+        SEXP col = VECTOR_ELT(ans, oj);
+        col_t *c = &g.cols[c0 + src[oj]];
         for (R_xlen_t r = data0; r < r1; r++) {
             /* SST is the hot case; indices were validated at parse time */
             if (cell_tag(c, r) == CELL_SST)
@@ -1759,17 +2058,29 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
 
     for (int i = 0; i < nworkers; i++) pthread_join(fth[i], NULL);
 
-    for (int di = 0; di < ndatecols; di++) {
-        SEXP col = VECTOR_ELT(ans, datecol[di]);
-        SEXP kl = PROTECT(allocVector(STRSXP, 2));
-        SET_STRING_ELT(kl, 0, mkChar("POSIXct"));
-        SET_STRING_ELT(kl, 1, mkChar("POSIXt"));
-        setAttrib(col, R_ClassSymbol, kl);
-        setAttrib(col, install("tzone"), mkString("UTC"));
-        UNPROTECT(1);
+    SEXP dklass = PROTECT(allocVector(STRSXP, 2));
+    SET_STRING_ELT(dklass, 0, mkChar("POSIXct"));
+    SET_STRING_ELT(dklass, 1, mkChar("POSIXt"));
+    SEXP tz = PROTECT(mkString("UTC"));
+
+    /* forced columns holding strings, and list columns, convert here after
+       the join: an allocation-failure longjmp mid-conversion must not leave
+       workers writing into vectors the unwind made collectable */
+    for (int ci = 0; ci < nconvcols; ci++) {
+        int oj = convcol[ci];
+        force_col_main(w, VECTOR_ELT(ans, oj), &g.cols[c0 + src[oj]],
+                       typ[src[oj]], data0, r1, date1904, epoch, trim,
+                       sst_table, dklass, tz, &nfail[oj], &ffail[oj]);
     }
 
-    for (int j = 0; j < nc; j++) {
+    for (int di = 0; di < ndatecols; di++) {
+        SEXP col = VECTOR_ELT(ans, datecol[di]);
+        setAttrib(col, R_ClassSymbol, dklass);
+        setAttrib(col, install("tzone"), tz);
+    }
+
+    for (int oj = 0; oj < out_nc; oj++) {
+        int j = src[oj];
         if (want_names && r1 > r0) {
             SEXP nm = cell_charsxp(&g.cols[c0 + j], r0, sst_table, n_sst, trim);
             if (nm == NA_STRING) {
@@ -1777,16 +2088,30 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
                 snprintf(tmp, sizeof tmp, "V%d", j + 1);
                 nm = mkCharLenCE(tmp, (int)strlen(tmp), CE_UTF8);
             }
-            SET_STRING_ELT(nms, j, nm);
+            SET_STRING_ELT(nms, oj, nm);
         } else {
             char tmp[16];
             snprintf(tmp, sizeof tmp, "V%d", j + 1);
-            SET_STRING_ELT(nms, j, mkCharLenCE(tmp, (int)strlen(tmp), CE_UTF8));
+            SET_STRING_ELT(nms, oj, mkCharLenCE(tmp, (int)strlen(tmp), CE_UTF8));
         }
     }
 
+    for (int oj = 0; oj < out_nc; oj++) {
+        if (nfail[oj] <= 0) continue;
+        int t = typ[src[oj]];
+        const char *tname = t == COL_LGL ? "logical"
+                            : t == COL_NUM ? "numeric" : "date";
+        char ref[32];
+        a1_ref(win->c0 + c0 + src[oj], (long)(win->r0 + ffail[oj]) + 1, ref,
+               sizeof ref);
+        warning("%lld cell%s in column '%s' could not be coerced to %s and "
+                "became NA (first at %s)",
+                (long long)nfail[oj], nfail[oj] == 1 ? "" : "s",
+                CHAR(STRING_ELT(nms, oj)), tname, ref);
+    }
+
     setAttrib(ans, R_NamesSymbol, nms);
-    UNPROTECT(2);
+    UNPROTECT(4);
     return ans;
 }
 
@@ -1794,7 +2119,7 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
    workbook order), extract them while workbook metadata parses, then
    materialize each.  Returns a list named by actual sheet names. */
 static SEXP read_impl(const char *cpath, SEXP sheetsArg, int want_names,
-                      int trim, const win_t *win)
+                      int trim, SEXP ctypesArg, const win_t *win)
 {
     wb_t w;
     wb_open(&w, cpath);
@@ -1871,7 +2196,7 @@ static SEXP read_impl(const char *cpath, SEXP sheetsArg, int want_names,
     for (R_xlen_t i = 0; i < nsel; i++)
         SET_VECTOR_ELT(out, i,
                        sheet_to_df(&w, sheets[i], win, want_names, trim,
-                                   sst_table, interned));
+                                   ctypesArg, sst_table, interned));
     setAttrib(out, R_NamesSymbol, onms);
     UNPROTECT(3);
     return out;
@@ -1894,26 +2219,27 @@ static win_t win_decode(SEXP w)
 }
 
 SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg,
-                 SEXP winArg)
+                 SEXP winArg, SEXP colTypesArg)
 {
     const char *cpath = translateChar(STRING_ELT(path, 0));
     if (XLENGTH(sheetArg) != 1) error("'sheet' must select a single sheet");
     win_t win = win_decode(winArg);
     SEXP out = PROTECT(read_impl(cpath, sheetArg,
                                  asLogical(colNamesArg) == TRUE,
-                                 asLogical(trimArg) == TRUE, &win));
+                                 asLogical(trimArg) == TRUE, colTypesArg,
+                                 &win));
     SEXP ans = VECTOR_ELT(out, 0);
     UNPROTECT(1);
     return ans;
 }
 
 SEXP C_read_xlsx_all(SEXP path, SEXP sheetsArg, SEXP colNamesArg, SEXP trimArg,
-                     SEXP winArg)
+                     SEXP winArg, SEXP colTypesArg)
 {
     const char *cpath = translateChar(STRING_ELT(path, 0));
     win_t win = win_decode(winArg);
     return read_impl(cpath, sheetsArg, asLogical(colNamesArg) == TRUE,
-                     asLogical(trimArg) == TRUE, &win);
+                     asLogical(trimArg) == TRUE, colTypesArg, &win);
 }
 
 SEXP C_sheet_names(SEXP path)

@@ -1,5 +1,5 @@
 read_xlsx <- function(path, sheet = 1L, col_names = TRUE, trim_ws = TRUE,
-                      range = NULL, skip = 0L, n_max = Inf) {
+                      range = NULL, skip = 0L, n_max = Inf, col_types = NULL) {
     path <- path.expand(path)
     if (!file.exists(path)) stop("file not found: ", path)
     if (!is.null(range)) {
@@ -10,7 +10,7 @@ read_xlsx <- function(path, sheet = 1L, col_names = TRUE, trim_ws = TRUE,
         win <- skip_window(skip, n_max)
     if (!is.character(sheet)) sheet <- as.integer(sheet)
     out <- .Call(C_read_xlsx, path, sheet, isTRUE(col_names), isTRUE(trim_ws),
-                 win)
+                 win, parse_col_types(col_types))
     n <- if (length(out)) length(out[[1L]]) else 0L
     names(out) <- make.unique(names(out), sep = "_")
     structure(out, class = "data.frame", row.names = c(NA_integer_, -n))
@@ -18,7 +18,7 @@ read_xlsx <- function(path, sheet = 1L, col_names = TRUE, trim_ws = TRUE,
 
 read_xlsx_all <- function(path, sheets = NULL, col_names = TRUE,
                           trim_ws = TRUE, range = NULL, skip = 0L,
-                          n_max = Inf) {
+                          n_max = Inf, col_types = NULL) {
     path <- path.expand(path)
     if (!file.exists(path)) stop("file not found: ", path)
     if (!is.null(sheets)) {
@@ -34,7 +34,7 @@ read_xlsx_all <- function(path, sheets = NULL, col_names = TRUE,
     } else
         win <- skip_window(skip, n_max)
     out <- .Call(C_read_xlsx_all, path, sheets, isTRUE(col_names),
-                 isTRUE(trim_ws), win)
+                 isTRUE(trim_ws), win, parse_col_types(col_types))
     lapply(out, function(cols) {
         n <- if (length(cols)) length(cols[[1L]]) else 0L
         names(cols) <- make.unique(names(cols), sep = "_")
@@ -46,6 +46,22 @@ xlsx_sheets <- function(path) {
     path <- path.expand(path)
     if (!file.exists(path)) stop("file not found: ", path)
     .Call(C_sheet_names, path)
+}
+
+# integer codes consumed by the C reader; order must match its COL_ enum
+parse_col_types <- function(col_types) {
+    if (is.null(col_types)) return(NULL)
+    if (!is.character(col_types) || length(col_types) == 0L ||
+        anyNA(col_types))
+        stop("'col_types' must be a character vector of column types")
+    types <- c("guess", "skip", "logical", "numeric", "date", "text", "list")
+    i <- match(col_types, types)
+    if (anyNA(i))
+        stop("unknown col_types value(s): ",
+             paste0("'", unique(col_types[is.na(i)]), "'", collapse = ", "),
+             "; valid types are ",
+             paste0("'", types, "'", collapse = ", "))
+    as.integer(i - 1L)
 }
 
 # window vector consumed by the C reader:

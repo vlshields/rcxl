@@ -300,4 +300,31 @@ gen("multisheet.xlsx", {
   write_xlsx_parts(file.path(out_dir, "multisheet.xlsx"), parts)
 })
 
+## ---- types.xlsx: col_types coercion matrix -------------------------------
+# columns: id (sst strings w/ leading zeros), amount (num), flag (bool),
+# stamp (date-styled), mix (num/sst/bool/date), words (sst bool-ish/num-ish)
+gen("types.xlsx", {
+  uniq <- c("007", "00042", "12345", "twenty", "TRUE", "false", " 3.5 ", "abc",
+            "id", "amount", "flag", "stamp", "mix", "words")
+  hdr <- paste0('<row r="1">',
+                paste0('<c r="', col_letter(1:6), '1" t="s"><v>', 8:13, '</v></c>',
+                       collapse = ""),
+                '</row>')
+  sst <- function(ref, i) paste0('<c r="', ref, '" t="s"><v>', i, '</v></c>')
+  num <- function(ref, v) paste0('<c r="', ref, '"><v>', v, '</v></c>')
+  bool <- function(ref, v) paste0('<c r="', ref, '" t="b"><v>', v, '</v></c>')
+  dat <- function(ref, v) paste0('<c r="', ref, '" s="1"><v>', v, '</v></c>')
+  body <- paste0(hdr,
+    '<row r="2">', sst("A2", 0), num("B2", "1.5"), bool("C2", 1),
+                   dat("D2", 44197), num("E2", 10), sst("F2", 4), '</row>',
+    '<row r="3">', sst("A3", 1), num("B3", "-2"), bool("C3", 0),
+                   dat("D3", "44562.5"), sst("E3", 3), sst("F3", 5), '</row>',
+    '<row r="4">', sst("A4", 2), num("B4", "0"), dat("D4", 30),
+                   bool("E4", 1), sst("F4", 6), '</row>',
+    '<row r="5">', num("B5", "1e6"), bool("C5", 1),
+                   dat("E5", 61), sst("F5", 7), '</row>')
+  s1 <- sheet_xml("A1:F5", body)
+  write_xlsx_parts(file.path(out_dir, "types.xlsx"), base_parts(s1, sst = uniq))
+})
+
 cat("fixtures written to ", out_dir, "\n", sep = "")

@@ -169,5 +169,112 @@ if (requireNamespace("readxl", quietly = TRUE)) {
         "out-of-limit column errors")
 } else cat("note: readxl not available; skipping range/skip/n_max checks\n")
 
+## ---- 5. col_types ---------------------------------------------------------
+
+ty <- fx("types")
+if (file.exists(ty)) {
+  warns <- function(expr) {
+    w <- character()
+    val <- withCallingHandlers(expr, warning = function(c) {
+      w <<- c(w, conditionMessage(c)); invokeRestart("muffleWarning")
+    })
+    list(val = val, w = w)
+  }
+
+  tx <- read_xlsx(ty, col_types = "text")
+  check(all(vapply(tx, is.character, TRUE)), "col_types text: all chr")
+  check(identical(tx$id, c("007", "00042", "12345", NA)),
+        "col_types text keeps leading zeros")
+  check(identical(tx$amount, c("1.5", "-2", "0", "1000000")),
+        "col_types text renders numerics")
+  check(identical(tx$flag, c("TRUE", "FALSE", NA, "TRUE")),
+        "col_types text renders booleans")
+  check(identical(tx$stamp, c("44197", "44562.5", "30", NA)),
+        "col_types text renders date serials")
+
+  r <- warns(read_xlsx(ty, col_types = "numeric"))
+  nm <- r$val
+  check(all(vapply(nm, is.numeric, TRUE)), "col_types numeric: all num")
+  check(identical(nm$id, c(7, 42, 12345, NA)), "text-to-numeric coercion")
+  check(identical(nm$flag, c(1, 0, NA, 1)), "bool-to-numeric coercion")
+  # divergence from readxl (which yields NA): dates become their serial,
+  # matching what guessing already does for mixed numeric/date columns
+  check(identical(nm$stamp, c(44197, 44562.5, 30, NA)),
+        "date-to-numeric gives the serial")
+  check(identical(nm$mix, c(10, NA, 1, 61)), "mixed-to-numeric")
+  check(identical(nm$words, c(NA, NA, 3.5, NA)), "words-to-numeric")
+  check(length(r$w) == 2 && any(grepl("column 'mix'.*first at E3", r$w)) &&
+          any(grepl("3 cells in column 'words'", r$w)),
+        "numeric coercion warnings")
+
+  r <- warns(read_xlsx(ty, col_types = "logical"))
+  lg <- r$val
+  check(identical(lg$words, c(TRUE, FALSE, NA, NA)), "text-to-logical")
+  check(identical(lg$amount, c(TRUE, TRUE, FALSE, TRUE)), "num-to-logical")
+  check(identical(lg$stamp, c(NA, NA, NA, NA)) &&
+          any(grepl("column 'stamp'.*logical", r$w)),
+        "date-to-logical fails with warning")
+
+  r <- warns(read_xlsx(ty, col_types = "date"))
+  dt <- r$val
+  check(identical(dt$stamp, read_xlsx(ty)$stamp), "forced date == guessed date")
+  check(inherits(dt$amount, "POSIXct") &&
+          identical(as.numeric(dt$amount[1]),
+                    as.numeric(utc("1900-01-01 12:00:00"))),
+        "numeric-to-date treats value as serial")
+  check(is.na(dt$amount[2]) && any(grepl("column 'amount'.*first at B3", r$w)),
+        "negative serial is not a date")
+  check(all(is.na(dt$words)) && any(grepl("column 'words'.*date", r$w)),
+        "text never parses as date")
+
+  li <- read_xlsx(ty, col_types = "list")$mix
+  check(is.list(li) && identical(li[[1]], 10) &&
+          identical(li[[2]], "twenty") && identical(li[[3]], TRUE) &&
+          inherits(li[[4]], "POSIXct"),
+        "list column cell types")
+  check(identical(read_xlsx(ty, col_types = "list")$id[[4]], NA),
+        "list column blank is logical NA")
+
+  sk <- read_xlsx(ty, col_types = c("text", "skip", "guess", "skip", "skip", "guess"))
+  check(identical(names(sk), c("id", "flag", "words")), "skip drops columns")
+  check(ncol(read_xlsx(ty, col_types = "skip")) == 0, "all-skip gives 0 cols")
+
+  nh <- read_xlsx(ty, col_names = FALSE, col_types = "text")
+  check(identical(nh[[1]][1:2], c("id", "007")),
+        "col_names=FALSE types the header row too")
+
+  check(inherits(try(read_xlsx(ty, col_types = c("text", "text")), silent = TRUE),
+                 "try-error"), "col_types length mismatch errors")
+  check(inherits(try(read_xlsx(ty, col_types = "banana"), silent = TRUE),
+                 "try-error"), "unknown col_types errors")
+  check(inherits(try(read_xlsx(ty, col_types = character()), silent = TRUE),
+                 "try-error"), "empty col_types errors")
+
+  if (requireNamespace("readxl", quietly = TRUE)) {
+    rdx2 <- function(...) as.data.frame(suppressWarnings(suppressMessages(
+      readxl::read_excel(..., progress = FALSE))))
+    a <- read_xlsx(ty, col_types = "text")
+    b <- rdx2(ty, col_types = "text")
+    for (j in c("id", "flag", "stamp", "mix", "words"))
+      check(identical(a[[j]], b[[j]]), paste0("readxl parity: text ", j))
+    a <- suppressWarnings(
+      read_xlsx(ty, col_types = c("skip", "numeric", "logical", "date", "skip", "skip")))
+    b <- rdx2(ty, col_types = c("skip", "numeric", "logical", "date", "skip", "skip"))
+    check(identical(a$amount, b$amount), "readxl parity: forced numeric")
+    check(identical(a$flag, b$flag), "readxl parity: forced logical")
+    check(identical(as.numeric(a$stamp), as.numeric(b$stamp)),
+          "readxl parity: forced date")
+    a <- read_xlsx(ty, col_types = "list")
+    b <- rdx2(ty, col_types = "list")
+    check(identical(a$words, b$words) && identical(a$id, b$id),
+          "readxl parity: list column")
+  }
+
+  # spec applies per sheet in read_xlsx_all
+  at <- read_xlsx_all(fx("multisheet"), col_types = "text")
+  check(all(vapply(seq_along(at), function(i) identical(at[[i]]$x, as.character(i)), TRUE)),
+        "read_xlsx_all col_types")
+} else cat("note: types.xlsx fixture missing; skipping col_types checks\n")
+
 if (fails > 0L) stop(fails, " golden check(s) failed")
 cat("all golden checks passed\n")
