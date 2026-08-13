@@ -276,5 +276,74 @@ if (file.exists(ty)) {
         "read_xlsx_all col_types")
 } else cat("note: types.xlsx fixture missing; skipping col_types checks\n")
 
+## ---- 6. na strings --------------------------------------------------------
+
+naf <- fx("na")
+if (file.exists(naf)) {
+  warns2 <- function(expr) {
+    w <- character()
+    val <- withCallingHandlers(expr, warning = function(c) {
+      w <<- c(w, conditionMessage(c)); invokeRestart("muffleWarning")
+    })
+    list(val = val, w = w)
+  }
+
+  d0 <- read_xlsx(naf)
+  check(identical(d0$num, c(1, -999, 3, 1000)), "na default keeps sentinels")
+  check(identical(d0$txt, c("ok", "N/A", "N/A", "n/a")), "na default strings")
+  check(identical(d0$mix, c("5", "-999", "TRUE", "N/A")),
+        "na default mixed col is text")
+  check(identical(d0$emp, c(NA, NA, "z", NA)),
+        "na default: empty text reads NA")
+  check(identical(d0$gone, rep("N/A", 4L)), "na default keeps gone col")
+
+  d <- read_xlsx(naf, na = c("", "N/A", "-999"))
+  check(identical(d$num, c(1, NA, 3, 1000)), "numeric sentinel NA by value")
+  check(identical(d$txt, c("ok", NA, NA, "n/a")),
+        "string na: padded matches, case does not")
+  check(identical(d$mix, c(5, NA, 1, NA)), "na frees mixed col to numeric")
+  check(is.logical(d$gone) && all(is.na(d$gone)), "all-na col is logical NA")
+
+  d2 <- read_xlsx(naf, na = "N&A")
+  check(identical(d2$raw, c(NA, "x&y", "<z>", "q")),
+        "entity-laden value matches decoded na")
+  check(identical(d2$emp, c("", "", "z", NA)),
+        "na without \"\" keeps empty strings")
+
+  check(identical(read_xlsx(naf, na = "1e3")$num, c(1, -999, 3, NA)),
+        "numeric na matches by value, not text")
+
+  d4 <- read_xlsx(naf, na = "44562.5")
+  check(inherits(d4$dt, "POSIXct") && is.na(d4$dt[2]) &&
+          identical(is.na(d4$dt), c(FALSE, TRUE, FALSE, FALSE)),
+        "date cell na by serial value")
+
+  ct <- rep("guess", 7); ct[4] <- "numeric"
+  r <- warns2(read_xlsx(naf, na = "N&A", col_types = ct))
+  check(all(is.na(r$val$raw)) && length(r$w) == 1 &&
+          grepl("3 cells in column 'raw'", r$w),
+        "forced numeric: na cells are silent, the rest warn")
+
+  tx <- read_xlsx(naf, na = "-999", col_types = "text")
+  check(identical(tx$num, c("1", NA, "3", "1000")),
+        "forced text renders na-matched numeric as NA")
+
+  al <- read_xlsx_all(naf, na = "N/A")
+  check(all(is.na(al[[1]]$gone)), "read_xlsx_all passes na through")
+
+  if (requireNamespace("readxl", quietly = TRUE)) {
+    ref <- as.data.frame(suppressWarnings(suppressMessages(
+      readxl::read_excel(naf, na = c("N/A", "-999"), progress = FALSE))))
+    got <- suppressWarnings(read_xlsx(naf, na = c("N/A", "-999")))
+    check(identical(got$num, ref$num), "readxl parity: na numeric col")
+    check(identical(got$txt, ref$txt), "readxl parity: na string col")
+    check(identical(is.na(got$mix), is.na(ref$mix)),
+          "readxl parity: na mixed col NA pattern")
+  }
+
+  check(inherits(try(read_xlsx(naf, na = NA), silent = TRUE), "try-error"),
+        "na containing NA errors")
+} else cat("note: na.xlsx fixture missing; skipping na checks\n")
+
 if (fails > 0L) stop(fails, " golden check(s) failed")
 cat("all golden checks passed\n")

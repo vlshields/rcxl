@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <stdint.h>
 #include <math.h>
 #include <R.h>
@@ -489,11 +490,43 @@ static void parse_styles(buf_t sty, unsigned char **xf_date_out, int *n_xf_out)
 
 static str_t str_trim(str_t s);
 
-static void parse_sst(buf_t sst, str_t **out, long *n_out, unsigned char **blank_out)
+/* User-supplied NA strings.  Entries are matched byte-exact against
+   whitespace-trimmed cell text; entries that themselves parse as numbers
+   additionally blank numeric cells by value, so "-999" catches the sentinel
+   however Excel chose to store it.  Built once per read on the main thread,
+   read-only afterwards (workers may match concurrently). */
+typedef struct {
+    str_t *v;        /* non-empty entries, UTF-8 */
+    double *num;     /* the entries that parse as numbers */
+    int n, nnum;
+    int has_empty;   /* "" in the set: empty/whitespace-only text reads NA */
+    int min_len, max_len;
+} naset_t;
+
+/* s must already be whitespace-trimmed */
+static int na_match(const naset_t *na, str_t s)
+{
+    if (s.n == 0) return na->has_empty;
+    if (s.n < na->min_len || s.n > na->max_len) return 0;
+    for (int i = 0; i < na->n; i++)
+        if (na->v[i].n == s.n && memcmp(na->v[i].p, s.p, (size_t)s.n) == 0)
+            return 1;
+    return 0;
+}
+
+static int na_match_num(const naset_t *na, double d)
+{
+    for (int i = 0; i < na->nnum; i++)
+        if (na->num[i] == d) return 1;
+    return 0;
+}
+
+static void parse_sst(buf_t sst, str_t **out, long *n_out, unsigned char **na_out,
+                      const naset_t *naset)
 {
     *out = NULL;
     *n_out = 0;
-    *blank_out = NULL;
+    *na_out = NULL;
     if (!sst.p) return;
     const char *end = sst.p + sst.n;
     long cap = 0;
@@ -531,14 +564,16 @@ static void parse_sst(buf_t sst, str_t **out, long *n_out, unsigned char **blank
             arr[n].n = 0;
         } else
             arr[n] = collect_text(body, stop);
-        /* cells referencing empty/whitespace-only entries read as blanks */
-        blank[n] = !arr[n].p || str_trim(arr[n]).n == 0;
+        /* cells referencing na-matched entries (empty/whitespace-only by
+           default) read as NA; matched once per unique string, so every
+           later cell hit is a single byte lookup */
+        blank[n] = (unsigned char)na_match(naset, str_trim(arr[n]));
         n++;
         p = stop;
     }
     *out = arr;
     *n_out = n;
-    *blank_out = blank;
+    *na_out = blank;
 }
 
 
@@ -652,9 +687,10 @@ typedef struct {
     unsigned char *xf_date;
     int n_xf;
     str_t *sst;
-    unsigned char *sst_blank;
+    unsigned char *sst_na;
     long n_sst;
     int date1904;
+    naset_t na;
 } wb_t;
 
 static void wb_open(wb_t *w, const char *cpath)
@@ -678,7 +714,7 @@ static void wb_meta(wb_t *w)
     zread(&w->za, "xl/styles.xml", &sty);
     w->date1904 = wb_date1904(w->wb);
     parse_styles(sty, &w->xf_date, &w->n_xf);
-    parse_sst(sstbuf, &w->sst, &w->n_sst, &w->sst_blank);
+    parse_sst(sstbuf, &w->sst, &w->n_sst, &w->sst_na, &w->na);
 }
 
 
@@ -689,8 +725,9 @@ enum {
     CELL_SST,
     CELL_STR,
     CELL_BOOL,
-    CELL_EMPTY,  /* had a value that is empty/whitespace-only text: counts
-                    for sheet extent, but is NA and never affects typing */
+    CELL_EMPTY,  /* had a value matching the na set (empty/whitespace-only
+                    text by default): counts for sheet extent, but is NA and
+                    never affects typing */
     CELL_STR_RAW,/* value slice still XML-escaped; decoded at materialization */
     CELL_IS_RAW  /* <is> body slice; runs collected at materialization */
 };
@@ -870,8 +907,9 @@ typedef struct {
     grid_t *g;
     const unsigned char *xf_date;
     int n_xf;
-    const unsigned char *sst_blank;
+    const unsigned char *sst_na;
     long n_sst;
+    const naset_t *na;
     unsigned char *sst_used;   /* chunk-private in threaded mode */
     R_xlen_t *counts;          /* chunk-private, [MAX_COLS * 5] */
     R_xlen_t rmin, rmax;
@@ -890,14 +928,16 @@ static void chunk_extent(chunk_t *ck, int col, R_xlen_t row)
 }
 
 /* store a string cell: CELL_STR holds a ready slice; the RAW tags hold
-   slices decoded at materialization time.  Empty/whitespace-only text reads
-   as NA without influencing typing (readxl semantics), but still counts
-   toward the sheet extent. */
+   slices decoded at materialization time.  Text matching the na set
+   (empty/whitespace-only by default) reads as NA without influencing typing
+   (readxl semantics), but still counts toward the sheet extent.  RAW slices
+   cannot be matched here -- they are na-checked after decoding at
+   materialization instead. */
 static void chunk_set_str(chunk_t *ck, col_t *c, int col, R_xlen_t row,
                           str_t s, unsigned char tag)
 {
     chunk_extent(ck, col, row);
-    if (tag == CELL_STR && str_trim(s).n == 0) {
+    if (tag == CELL_STR && na_match(ck->na, str_trim(s))) {
         c->tag[row] = CELL_EMPTY;
         return;
     }
@@ -1099,7 +1139,7 @@ static void parse_rows(chunk_t *ck)
             if (t == 's') {
                 long i = slice_long(vs, vlen);
                 chunk_extent(ck, crel, row);
-                if (i < 0 || i >= ck->n_sst || ck->sst_blank[i]) {
+                if (i < 0 || i >= ck->n_sst || ck->sst_na[i]) {
                     c->tag[row] = CELL_EMPTY;
                 } else {
                     c->tag[row] = CELL_SST;
@@ -1129,17 +1169,21 @@ static void parse_rows(chunk_t *ck)
                     ok = ep && *ep == 0;
                 }
                 if (ok) {
-                    int isdate = style >= 0 && style < ck->n_xf &&
-                                 ck->xf_date[style];
                     chunk_extent(ck, crel, row);
-                    if (isdate) {
-                        c->tag[row] = CELL_DATE;
-                        ck->counts[crel * 5 + CNT_DATE]++;
+                    if (ck->na->nnum && na_match_num(ck->na, d)) {
+                        c->tag[row] = CELL_EMPTY;
                     } else {
-                        c->tag[row] = CELL_NUM;
-                        ck->counts[crel * 5 + CNT_NUM]++;
+                        int isdate = style >= 0 && style < ck->n_xf &&
+                                     ck->xf_date[style];
+                        if (isdate) {
+                            c->tag[row] = CELL_DATE;
+                            ck->counts[crel * 5 + CNT_DATE]++;
+                        } else {
+                            c->tag[row] = CELL_NUM;
+                            ck->counts[crel * 5 + CNT_NUM]++;
+                        }
+                        c->num[row] = d;
                     }
-                    c->num[row] = d;
                 } else
                     chunk_set_value_str(ck, c, crel, row, vs, vlen);
             } else if (vlen > 0)
@@ -1186,7 +1230,8 @@ static R_xlen_t *chunk_counts_alloc(void)
 
 static void chunk_init(chunk_t *ck, buf_t sheet, grid_t *g, const win_t *win,
                        const unsigned char *xf_date, int n_xf,
-                       const unsigned char *sst_blank, long n_sst)
+                       const unsigned char *sst_na, long n_sst,
+                       const naset_t *naset)
 {
     memset(ck, 0, sizeof *ck);
     ck->begin = sheet.p;
@@ -1194,8 +1239,9 @@ static void chunk_init(chunk_t *ck, buf_t sheet, grid_t *g, const win_t *win,
     ck->g = g;
     ck->xf_date = xf_date;
     ck->n_xf = n_xf;
-    ck->sst_blank = sst_blank;
+    ck->sst_na = sst_na;
     ck->n_sst = n_sst;
+    ck->na = naset;
     ck->counts = chunk_counts_alloc();
     ck->rmin = R_XLEN_T_MAX;
     ck->rmax = -1;
@@ -1238,8 +1284,8 @@ static void win_dims(const win_t *win, long dim_rows, int dim_cols,
 
 static void parse_sheet_serial(buf_t sheet, grid_t *g, const win_t *win,
                                const unsigned char *xf_date, int n_xf,
-                               const unsigned char *sst_blank, long n_sst,
-                               unsigned char *sst_used)
+                               const unsigned char *sst_na, long n_sst,
+                               unsigned char *sst_used, const naset_t *naset)
 {
     long dim_rows;
     int dim_cols;
@@ -1252,7 +1298,7 @@ static void parse_sheet_serial(buf_t sheet, grid_t *g, const win_t *win,
         grid_ensure_col(g, crel_max);
 
     chunk_t ck;
-    chunk_init(&ck, sheet, g, win, xf_date, n_xf, sst_blank, n_sst);
+    chunk_init(&ck, sheet, g, win, xf_date, n_xf, sst_na, n_sst, naset);
     ck.sst_used = sst_used;   /* serial: write the shared map directly */
     ck.can_grow = 1;
     parse_rows(&ck);
@@ -1271,8 +1317,9 @@ static void *parse_rows_thread(void *arg)
    or r=, out-of-range rows, thread failure). */
 static int parse_sheet_mt(buf_t sheet, grid_t *g, const win_t *win,
                           const unsigned char *xf_date, int n_xf,
-                          const unsigned char *sst_blank, long n_sst,
-                          unsigned char *sst_used, int nthreads)
+                          const unsigned char *sst_na, long n_sst,
+                          unsigned char *sst_used, const naset_t *naset,
+                          int nthreads)
 {
     const char *end = sheet.p + sheet.n;
     long dim_rows;
@@ -1334,7 +1381,7 @@ static int parse_sheet_mt(buf_t sheet, grid_t *g, const win_t *win,
         buf_t part;
         part.p = (char *)bounds[i];
         part.n = (size_t)(bounds[i + 1] - bounds[i]);
-        chunk_init(ck, part, g, win, xf_date, n_xf, sst_blank, n_sst);
+        chunk_init(ck, part, g, win, xf_date, n_xf, sst_na, n_sst, naset);
         if (n_sst) {
             ck->sst_used = (unsigned char *)scratch_alloc((size_t)n_sst);
             memset(ck->sst_used, 0, (size_t)n_sst);
@@ -1376,7 +1423,7 @@ static int rcxl_nthreads(size_t sheet_bytes)
 
 
 static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_sst,
-                         int trim)
+                         int trim, const naset_t *na)
 {
     char tmp[32];
     switch (cell_tag(c, row)) {
@@ -1397,7 +1444,7 @@ static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_ss
                       ? xml_unescape(raw.p, raw.n)
                       : collect_text(raw.p, raw.p + raw.n);
         str_t st = str_trim(s);
-        if (st.n == 0) return NA_STRING;
+        if (na_match(na, st)) return NA_STRING;
         if (trim) s = st;
         return mkCharLenCE(s.p, s.n, CE_UTF8);
     }
@@ -1544,7 +1591,7 @@ static void force_col_main(const wb_t *w, SEXP col, const col_t *c, int t,
             case CELL_STR_RAW:
             case CELL_IS_RAW: {
                 SEXP cs = PROTECT(cell_charsxp(c, r, sst_table, w->n_sst,
-                                               trim));
+                                               trim, &w->na));
                 v = cs == NA_STRING ? ScalarLogical(NA_LOGICAL)
                                     : ScalarString(cs);
                 UNPROTECT(1);
@@ -1565,9 +1612,13 @@ static void force_col_main(const wb_t *w, SEXP col, const col_t *c, int t,
             if (tg == CELL_NUM || tg == CELL_DATE || tg == CELL_BOOL)
                 dp[i] = c->num[r];
             else if (cell_str_slice(w, c, r, tg, &s)) {
+                /* na-matched RAW cells reach here undecoded; they are NA,
+                   not coercion failures */
                 double d;
                 s = str_trim(s);
-                if (parse_num_any(s, &d))
+                if (na_match(&w->na, s))
+                    dp[i] = NA_REAL;
+                else if (parse_num_any(s, &d))
                     dp[i] = d;
                 else {
                     dp[i] = NA_REAL;
@@ -1585,7 +1636,7 @@ static void force_col_main(const wb_t *w, SEXP col, const col_t *c, int t,
             } else if (cell_str_slice(w, c, r, tg, &s)) {
                 int b;
                 s = str_trim(s);
-                if (s.n == 0)
+                if (s.n == 0 || na_match(&w->na, s))
                     lp[i] = NA_LOGICAL;
                 else if (parse_lgl_str(s, &b))
                     lp[i] = b;
@@ -1610,7 +1661,8 @@ static void force_col_main(const wb_t *w, SEXP col, const col_t *c, int t,
                 fail = 1;
             } else if (cell_str_slice(w, c, r, tg, &s)) {
                 dp[i] = NA_REAL;
-                fail = str_trim(s).n > 0;
+                s = str_trim(s);
+                fail = s.n > 0 && !na_match(&w->na, s);
             } else
                 dp[i] = NA_REAL;
             break;
@@ -1804,7 +1856,7 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
 {
     const unsigned char *xf_date = w->xf_date;
     int n_xf = w->n_xf;
-    const unsigned char *sst_blank = w->sst_blank;
+    const unsigned char *sst_na = w->sst_na;
     long n_sst = w->n_sst;
     int date1904 = w->date1904;
     unsigned char *sst_used =
@@ -1818,8 +1870,8 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
     int nth = rcxl_nthreads(sheet.n);
     int parsed = 0;
     if (nth > 1) {
-        parsed = parse_sheet_mt(sheet, &g, win, xf_date, n_xf, sst_blank,
-                                n_sst, sst_used, nth);
+        parsed = parse_sheet_mt(sheet, &g, win, xf_date, n_xf, sst_na,
+                                n_sst, sst_used, &w->na, nth);
         if (!parsed) {   /* bail: reset and rerun serially */
             memset(&g, 0, sizeof g);
             g.rmin = R_XLEN_T_MAX;
@@ -1828,8 +1880,8 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
         }
     }
     if (!parsed)
-        parse_sheet_serial(sheet, &g, win, xf_date, n_xf, sst_blank, n_sst,
-                           sst_used);
+        parse_sheet_serial(sheet, &g, win, xf_date, n_xf, sst_na, n_sst,
+                           sst_used, &w->na);
 
     /* only shared strings some cell actually references become CHARSXPs;
        entries interned for an earlier sheet are reused as-is */
@@ -2052,7 +2104,8 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
                                STRING_ELT(sst_table, (R_xlen_t)c->num[r]));
             else
                 SET_STRING_ELT(col, r - data0,
-                               cell_charsxp(c, r, sst_table, n_sst, trim));
+                               cell_charsxp(c, r, sst_table, n_sst, trim,
+                                            &w->na));
         }
     }
 
@@ -2082,7 +2135,8 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
     for (int oj = 0; oj < out_nc; oj++) {
         int j = src[oj];
         if (want_names && r1 > r0) {
-            SEXP nm = cell_charsxp(&g.cols[c0 + j], r0, sst_table, n_sst, trim);
+            SEXP nm = cell_charsxp(&g.cols[c0 + j], r0, sst_table, n_sst, trim,
+                                   &w->na);
             if (nm == NA_STRING) {
                 char tmp[16];
                 snprintf(tmp, sizeof tmp, "V%d", j + 1);
@@ -2115,14 +2169,47 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
     return ans;
 }
 
+static void naset_build(naset_t *na, SEXP naArg)
+{
+    memset(na, 0, sizeof *na);
+    na->min_len = INT_MAX;
+    R_xlen_t len = XLENGTH(naArg);
+    if (len == 0) return;
+    na->v = (str_t *)scratch_alloc((size_t)len * sizeof(str_t));
+    na->num = (double *)scratch_alloc((size_t)len * sizeof(double));
+    for (R_xlen_t i = 0; i < len; i++) {
+        SEXP el = STRING_ELT(naArg, i);
+        if (el == NA_STRING) continue;
+        /* translateCharUTF8's buffer is transient: copy into the scratch
+           arena, where workers may read it for the whole call */
+        const char *s = translateCharUTF8(el);
+        size_t n = strlen(s);
+        if (n == 0) { na->has_empty = 1; continue; }
+        if (n > INT_MAX) continue;
+        char *cp = (char *)scratch_alloc(n + 1);
+        memcpy(cp, s, n + 1);
+        na->v[na->n].p = cp;
+        na->v[na->n].n = (int)n;
+        na->n++;
+        if ((int)n < na->min_len) na->min_len = (int)n;
+        if ((int)n > na->max_len) na->max_len = (int)n;
+        char *ep = NULL;
+        double d = strtod(cp, &ep);
+        if (ep && ep != cp && *ep == 0) na->num[na->nnum++] = d;
+    }
+}
+
 /* Shared driver: resolve the requested sheets (R_NilValue = every sheet, in
    workbook order), extract them while workbook metadata parses, then
    materialize each.  Returns a list named by actual sheet names. */
 static SEXP read_impl(const char *cpath, SEXP sheetsArg, int want_names,
-                      int trim, SEXP ctypesArg, const win_t *win)
+                      int trim, SEXP ctypesArg, SEXP naArg, const win_t *win)
 {
+    /* validated before wb_open: an error() here must not skip zclose */
+    if (TYPEOF(naArg) != STRSXP) error("'na' must be a character vector");
     wb_t w;
     wb_open(&w, cpath);
+    naset_build(&w.na, naArg);
 
     R_xlen_t nsel = sheetsArg == R_NilValue ? (R_xlen_t)wb_sheet_count(w.wb)
                                             : XLENGTH(sheetsArg);
@@ -2219,7 +2306,7 @@ static win_t win_decode(SEXP w)
 }
 
 SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg,
-                 SEXP winArg, SEXP colTypesArg)
+                 SEXP winArg, SEXP colTypesArg, SEXP naArg)
 {
     const char *cpath = translateChar(STRING_ELT(path, 0));
     if (XLENGTH(sheetArg) != 1) error("'sheet' must select a single sheet");
@@ -2227,19 +2314,19 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg,
     SEXP out = PROTECT(read_impl(cpath, sheetArg,
                                  asLogical(colNamesArg) == TRUE,
                                  asLogical(trimArg) == TRUE, colTypesArg,
-                                 &win));
+                                 naArg, &win));
     SEXP ans = VECTOR_ELT(out, 0);
     UNPROTECT(1);
     return ans;
 }
 
 SEXP C_read_xlsx_all(SEXP path, SEXP sheetsArg, SEXP colNamesArg, SEXP trimArg,
-                     SEXP winArg, SEXP colTypesArg)
+                     SEXP winArg, SEXP colTypesArg, SEXP naArg)
 {
     const char *cpath = translateChar(STRING_ELT(path, 0));
     win_t win = win_decode(winArg);
     return read_impl(cpath, sheetsArg, asLogical(colNamesArg) == TRUE,
-                     asLogical(trimArg) == TRUE, colTypesArg, &win);
+                     asLogical(trimArg) == TRUE, colTypesArg, naArg, &win);
 }
 
 SEXP C_sheet_names(SEXP path)

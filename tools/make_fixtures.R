@@ -327,4 +327,36 @@ gen("types.xlsx", {
   write_xlsx_parts(file.path(out_dir, "types.xlsx"), base_parts(s1, sst = uniq))
 })
 
+## ---- na.xlsx: user-supplied NA strings -----------------------------------
+# columns: num (numeric incl. -999 and 1e3 sentinels), txt (sst/str strings,
+# one whitespace-padded), mix (num/sst/bool), raw (entity-laden t="str"),
+# emp (empty-string cells), gone (all "N/A"), dt (date serials)
+gen("na.xlsx", {
+  uniq <- c("N/A", "-999", "ok", "", "n/a",
+            "num", "txt", "mix", "raw", "emp", "gone", "dt")
+  hdr <- paste0('<row r="1">',
+                paste0('<c r="', col_letter(1:7), '1" t="s"><v>', 5:11, '</v></c>',
+                       collapse = ""),
+                '</row>')
+  sst <- function(ref, i) paste0('<c r="', ref, '" t="s"><v>', i, '</v></c>')
+  num <- function(ref, v) paste0('<c r="', ref, '"><v>', v, '</v></c>')
+  bool <- function(ref, v) paste0('<c r="', ref, '" t="b"><v>', v, '</v></c>')
+  dat <- function(ref, v) paste0('<c r="', ref, '" s="1"><v>', v, '</v></c>')
+  str <- function(ref, v) paste0('<c r="', ref, '" t="str"><v>', v, '</v></c>')
+  body <- paste0(hdr,
+    '<row r="2">', num("A2", 1), sst("B2", 2), num("C2", 5),
+                   str("D2", "N&amp;A"), sst("E2", 3), sst("F2", 0),
+                   dat("G2", 44197), '</row>',
+    '<row r="3">', num("A3", -999), sst("B3", 0), sst("C3", 1),
+                   str("D3", "x&amp;y"), str("E3", "   "), sst("F3", 0),
+                   dat("G3", "44562.5"), '</row>',
+    '<row r="4">', num("A4", 3), str("B4", " N/A "), bool("C4", 1),
+                   str("D4", "&lt;z&gt;"), str("E4", "z"), sst("F4", 0),
+                   dat("G4", 30), '</row>',
+    '<row r="5">', num("A5", "1e3"), sst("B5", 4), sst("C5", 0),
+                   str("D5", "q"), sst("F5", 0), dat("G5", 61), '</row>')
+  s1 <- sheet_xml("A1:G5", body)
+  write_xlsx_parts(file.path(out_dir, "na.xlsx"), base_parts(s1, sst = uniq))
+})
+
 cat("fixtures written to ", out_dir, "\n", sep = "")
