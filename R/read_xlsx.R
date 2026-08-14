@@ -10,8 +10,9 @@ read_xlsx <- function(path, sheet = 1L, col_names = TRUE, trim_ws = TRUE,
     } else
         win <- skip_window(skip, n_max)
     if (!is.character(sheet)) sheet <- as.integer(sheet)
-    out <- .Call(C_read_xlsx, path, sheet, isTRUE(col_names), isTRUE(trim_ws),
-                 win, parse_col_types(col_types), parse_na(na))
+    out <- .Call(C_read_xlsx, path, sheet, parse_col_names(col_names),
+                 isTRUE(trim_ws), win, parse_col_types(col_types),
+                 parse_na(na))
     n <- if (length(out)) length(out[[1L]]) else 0L
     names(out) <- make.unique(names(out), sep = "_")
     structure(out, class = "data.frame", row.names = c(NA_integer_, -n))
@@ -34,7 +35,7 @@ read_xlsx_all <- function(path, sheets = NULL, col_names = TRUE,
         win <- pr$win
     } else
         win <- skip_window(skip, n_max)
-    out <- .Call(C_read_xlsx_all, path, sheets, isTRUE(col_names),
+    out <- .Call(C_read_xlsx_all, path, sheets, parse_col_names(col_names),
                  isTRUE(trim_ws), win, parse_col_types(col_types),
                  parse_na(na))
     lapply(out, function(cols) {
@@ -48,6 +49,14 @@ xlsx_sheets <- function(path) {
     path <- path.expand(path)
     if (!file.exists(path)) stop("file not found: ", path)
     .Call(C_sheet_names, path)
+}
+
+# TRUE (first row is names), FALSE (V1, V2, ...), or one name per sheet
+# column including any col_types "skip" columns, whose names are dropped
+parse_col_names <- function(col_names) {
+    if (!is.character(col_names)) return(isTRUE(col_names))
+    if (anyNA(col_names)) stop("'col_names' must not contain NA")
+    col_names
 }
 
 # strings read as NA; matched against whitespace-trimmed cell text, and

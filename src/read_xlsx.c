@@ -1850,10 +1850,12 @@ static void *fill_thread(void *arg)
 
 /* parse one extracted worksheet and materialize it as a named column list;
    sst_table/sst_interned accumulate interned shared strings across sheets */
-static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
+static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, SEXP namesArg,
                         int trim, SEXP ctypesArg, SEXP sst_table,
                         unsigned char *sst_interned)
 {
+    int user_names = TYPEOF(namesArg) == STRSXP;
+    int want_names = !user_names && asLogical(namesArg) == TRUE;
     const unsigned char *xf_date = w->xf_date;
     int n_xf = w->n_xf;
     const unsigned char *sst_na = w->sst_na;
@@ -1925,6 +1927,10 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
     int nc = c1 - c0;
     if (nc < 0) nc = 0;
     if (n < 0) n = 0;
+
+    if (user_names && XLENGTH(namesArg) != nc)
+        error("'col_names' has length %lld but the sheet has %d column%s",
+              (long long)XLENGTH(namesArg), nc, nc == 1 ? "" : "s");
 
     /* per-column type overrides: a scalar recycles, otherwise one entry per
        materialized column; "skip" entries count here and are dropped below */
@@ -2134,7 +2140,9 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, int want_names,
 
     for (int oj = 0; oj < out_nc; oj++) {
         int j = src[oj];
-        if (want_names && r1 > r0) {
+        if (user_names) {
+            SET_STRING_ELT(nms, oj, STRING_ELT(namesArg, j));
+        } else if (want_names && r1 > r0) {
             SEXP nm = cell_charsxp(&g.cols[c0 + j], r0, sst_table, n_sst, trim,
                                    &w->na);
             if (nm == NA_STRING) {
@@ -2202,11 +2210,14 @@ static void naset_build(naset_t *na, SEXP naArg)
 /* Shared driver: resolve the requested sheets (R_NilValue = every sheet, in
    workbook order), extract them while workbook metadata parses, then
    materialize each.  Returns a list named by actual sheet names. */
-static SEXP read_impl(const char *cpath, SEXP sheetsArg, int want_names,
+static SEXP read_impl(const char *cpath, SEXP sheetsArg, SEXP namesArg,
                       int trim, SEXP ctypesArg, SEXP naArg, const win_t *win)
 {
     /* validated before wb_open: an error() here must not skip zclose */
     if (TYPEOF(naArg) != STRSXP) error("'na' must be a character vector");
+    if (TYPEOF(namesArg) != STRSXP &&
+        (TYPEOF(namesArg) != LGLSXP || XLENGTH(namesArg) != 1))
+        error("'col_names' must be TRUE, FALSE or a character vector");
     wb_t w;
     wb_open(&w, cpath);
     naset_build(&w.na, naArg);
@@ -2282,7 +2293,7 @@ static SEXP read_impl(const char *cpath, SEXP sheetsArg, int want_names,
     }
     for (R_xlen_t i = 0; i < nsel; i++)
         SET_VECTOR_ELT(out, i,
-                       sheet_to_df(&w, sheets[i], win, want_names, trim,
+                       sheet_to_df(&w, sheets[i], win, namesArg, trim,
                                    ctypesArg, sst_table, interned));
     setAttrib(out, R_NamesSymbol, onms);
     UNPROTECT(3);
@@ -2311,8 +2322,7 @@ SEXP C_read_xlsx(SEXP path, SEXP sheetArg, SEXP colNamesArg, SEXP trimArg,
     const char *cpath = translateChar(STRING_ELT(path, 0));
     if (XLENGTH(sheetArg) != 1) error("'sheet' must select a single sheet");
     win_t win = win_decode(winArg);
-    SEXP out = PROTECT(read_impl(cpath, sheetArg,
-                                 asLogical(colNamesArg) == TRUE,
+    SEXP out = PROTECT(read_impl(cpath, sheetArg, colNamesArg,
                                  asLogical(trimArg) == TRUE, colTypesArg,
                                  naArg, &win));
     SEXP ans = VECTOR_ELT(out, 0);
@@ -2325,7 +2335,7 @@ SEXP C_read_xlsx_all(SEXP path, SEXP sheetsArg, SEXP colNamesArg, SEXP trimArg,
 {
     const char *cpath = translateChar(STRING_ELT(path, 0));
     win_t win = win_decode(winArg);
-    return read_impl(cpath, sheetsArg, asLogical(colNamesArg) == TRUE,
+    return read_impl(cpath, sheetsArg, colNamesArg,
                      asLogical(trimArg) == TRUE, colTypesArg, naArg, &win);
 }
 

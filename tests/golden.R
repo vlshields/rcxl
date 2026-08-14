@@ -161,6 +161,33 @@ if (requireNamespace("readxl", quietly = TRUE)) {
   check(all(vapply(al, nrow, 0L) == 1) && al$Beta[[1]] == 2,
         "read_xlsx_all skip")
 
+  nm15 <- paste0("n", 1:15)
+  cmp_df(read_xlsx(m, col_names = nm15), rdx(m, col_names = nm15),
+         "character col_names")
+  cn <- read_xlsx(m, col_names = nm15)
+  check(identical(names(cn), nm15), "character col_names applied")
+  cn <- read_xlsx(m, col_names = nm15, n_max = 3)
+  check(identical(names(cn), nm15) && nrow(cn) == 3,
+        "col_names + n_max keeps header row as data")
+  cn <- read_xlsx(m, col_names = nm15,
+                  col_types = c("skip", rep("guess", 14)))
+  check(identical(names(cn), nm15[-1]), "skipped column's name is dropped")
+  cn <- read_xlsx(m, range = "B3:D10", col_names = c("p", "q", "r"))
+  check(identical(names(cn), c("p", "q", "r")) && nrow(cn) == 8,
+        "col_names sized to the range")
+  cn <- read_xlsx(m, col_names = rep("a", 15))
+  check(identical(names(cn)[1:3], c("a", "a_1", "a_2")),
+        "duplicate col_names deduplicated")
+  al <- read_xlsx_all(ms, col_names = "y")
+  check(all(vapply(al, names, "") == "y") && al$Beta$y[[1]] == "x",
+        "read_xlsx_all character col_names")
+  check(inherits(try(read_xlsx(m, col_names = c("a", "b")), silent = TRUE),
+                 "try-error"),
+        "wrong-length col_names errors")
+  check(inherits(try(read_xlsx(m, col_names = c(nm15[-1], NA)),
+                     silent = TRUE), "try-error"),
+        "NA in col_names errors")
+
   check(inherits(try(read_xlsx(m, range = "banana"), silent = TRUE), "try-error"),
         "malformed range errors")
   check(inherits(try(read_xlsx(m, skip = -1), silent = TRUE), "try-error"),
