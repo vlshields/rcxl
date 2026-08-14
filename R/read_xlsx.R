@@ -1,6 +1,8 @@
 read_xlsx <- function(path, sheet = 1L, col_names = TRUE, trim_ws = TRUE,
                       range = NULL, skip = 0L, n_max = Inf, col_types = NULL,
-                      na = "") {
+                      na = "", name_repair = c("unique", "minimal",
+                                               "check_unique")) {
+    name_repair <- match.arg(name_repair)
     path <- path.expand(path)
     if (!file.exists(path)) stop("file not found: ", path)
     if (!is.null(range)) {
@@ -14,13 +16,16 @@ read_xlsx <- function(path, sheet = 1L, col_names = TRUE, trim_ws = TRUE,
                  isTRUE(trim_ws), win, parse_col_types(col_types),
                  parse_na(na))
     n <- if (length(out)) length(out[[1L]]) else 0L
-    names(out) <- make.unique(names(out), sep = "_")
+    names(out) <- repair_names(names(out), name_repair)
     structure(out, class = "data.frame", row.names = c(NA_integer_, -n))
 }
 
 read_xlsx_all <- function(path, sheets = NULL, col_names = TRUE,
                           trim_ws = TRUE, range = NULL, skip = 0L,
-                          n_max = Inf, col_types = NULL, na = "") {
+                          n_max = Inf, col_types = NULL, na = "",
+                          name_repair = c("unique", "minimal",
+                                          "check_unique")) {
+    name_repair <- match.arg(name_repair)
     path <- path.expand(path)
     if (!file.exists(path)) stop("file not found: ", path)
     if (!is.null(sheets)) {
@@ -38,11 +43,11 @@ read_xlsx_all <- function(path, sheets = NULL, col_names = TRUE,
     out <- .Call(C_read_xlsx_all, path, sheets, parse_col_names(col_names),
                  isTRUE(trim_ws), win, parse_col_types(col_types),
                  parse_na(na))
-    lapply(out, function(cols) {
+    Map(function(cols, sheet) {
         n <- if (length(cols)) length(cols[[1L]]) else 0L
-        names(cols) <- make.unique(names(cols), sep = "_")
+        names(cols) <- repair_names(names(cols), name_repair, sheet)
         structure(cols, class = "data.frame", row.names = c(NA_integer_, -n))
-    })
+    }, out, names(out))
 }
 
 xlsx_sheets <- function(path) {
@@ -57,6 +62,21 @@ parse_col_names <- function(col_names) {
     if (!is.character(col_names)) return(isTRUE(col_names))
     if (anyNA(col_names)) stop("'col_names' must not contain NA")
     col_names
+}
+
+# "unique" suffixes repeats via make.unique, "minimal" keeps names as read,
+# "check_unique" errors on any repeat
+repair_names <- function(nms, name_repair, sheet = NULL) {
+    if (name_repair == "minimal") return(nms)
+    if (name_repair == "check_unique") {
+        d <- unique(nms[duplicated(nms)])
+        if (length(d))
+            stop("duplicate column names",
+                 if (!is.null(sheet)) paste0(" in sheet '", sheet, "'"),
+                 ": ", paste0("'", d, "'", collapse = ", "))
+        return(nms)
+    }
+    make.unique(nms, sep = "_")
 }
 
 # strings read as NA; matched against whitespace-trimmed cell text, and

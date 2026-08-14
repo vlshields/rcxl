@@ -372,5 +372,31 @@ if (file.exists(naf)) {
         "na containing NA errors")
 } else cat("note: na.xlsx fixture missing; skipping na checks\n")
 
+## ---- 7. name_repair -------------------------------------------------------
+
+m <- fx("mixed")
+if (file.exists(m)) {
+  dup <- rep("a", 15)
+  r <- read_xlsx(m, col_names = dup, name_repair = "minimal")
+  check(identical(names(r), dup), "name_repair minimal keeps duplicates")
+  err <- try(read_xlsx(m, col_names = dup, name_repair = "check_unique"),
+             silent = TRUE)
+  check(inherits(err, "try-error") &&
+          grepl("duplicate column names.*'a'", err),
+        "name_repair check_unique errors on duplicates")
+  r <- read_xlsx(m, name_repair = "check_unique")
+  check(is.data.frame(r), "name_repair check_unique passes unique names")
+  err <- try(read_xlsx_all(m, col_names = dup, name_repair = "check_unique"),
+             silent = TRUE)
+  check(inherits(err, "try-error") &&
+          grepl(paste0("sheet '", xlsx_sheets(m)[1], "'"), err),
+        "read_xlsx_all check_unique names the sheet")
+  al <- read_xlsx_all(m, col_names = dup, name_repair = "minimal")
+  check(identical(names(al[[1]]), dup), "read_xlsx_all minimal")
+  check(inherits(try(read_xlsx(m, name_repair = "banana"), silent = TRUE),
+                 "try-error"),
+        "unknown name_repair errors")
+} else cat("note: mixed.xlsx fixture missing; skipping name_repair checks\n")
+
 if (fails > 0L) stop(fails, " golden check(s) failed")
 cat("all golden checks passed\n")
