@@ -1,3 +1,53 @@
+#' Read an xlsx worksheet
+#'
+#' Reads one worksheet from an xlsx file into a data frame. Column types are
+#' guessed from the cells unless overridden with `col_types`.
+#'
+#' A guessed column becomes character if it holds any string cell, logical if
+#' it holds only booleans, `POSIXct` if it holds date cells and no plain
+#' numbers, and numeric otherwise. Columns with only blank cells become
+#' logical `NA`. Date cells are returned as `POSIXct` in UTC; both the 1900
+#' and 1904 date systems are handled, including the nonexistent 29 Feb 1900
+#' that the 1900 system counts.
+#'
+#' Cells that cannot be coerced to a type forced through `col_types` become
+#' `NA`, with a warning giving the count and the first offending cell.
+#'
+#' @param path Path to an xlsx file. Tilde expansion is applied.
+#' @param sheet Worksheet to read, as a 1-based index or a sheet name.
+#'   Overridden when `range` names a sheet.
+#' @param col_names `TRUE` to use the first row of the read area as column
+#'   names, `FALSE` to number them `V1`, `V2`, ..., or a character vector of
+#'   names, one per sheet column including any skipped via `col_types` (the
+#'   skipped names are dropped from the result).
+#' @param trim_ws Trim leading and trailing whitespace from string cells and
+#'   column names?
+#' @param range A1-style cell range to read: `"B3:D87"`, a single cell
+#'   `"B3"`, whole columns `"B:D"`, or whole rows `"3:87"`, optionally
+#'   sheet-qualified as `"Sheet1!B3:D87"` or `"'My Sheet'!B3:D87"`. When
+#'   given, `skip` and `n_max` are ignored. An axis the range bounds is read
+#'   exactly, blank cells included; an open axis is trimmed to the sheet
+#'   extent.
+#' @param skip Number of rows to skip before reading anything. Ignored when
+#'   `range` is given.
+#' @param n_max Maximum number of data rows to read. The column name row
+#'   does not count. Ignored when `range` is given.
+#' @param col_types `NULL` to guess every column, or a character vector of
+#'   `"guess"`, `"skip"`, `"logical"`, `"numeric"`, `"date"`, `"text"` or
+#'   `"list"`. A single value applies to every column; otherwise supply one
+#'   entry per sheet column, counting `"skip"` columns. A `"list"` column
+#'   keeps each cell's own type: length-one numeric, `POSIXct`, logical or
+#'   character elements, with blank cells as logical `NA`.
+#' @param na Character vector of strings to read as `NA`. Matched against
+#'   whitespace-trimmed cell text; entries that parse as numbers also blank
+#'   numeric and date cells holding that value.
+#' @param name_repair How to resolve column names in the result. `"unique"`
+#'   suffixes repeated names via [make.unique()] with separator `"_"`,
+#'   `"minimal"` keeps names as read, `"check_unique"` errors on any repeat.
+#' @return A `data.frame` with one column per worksheet column read.
+#' @seealso [read_xlsx_all()] to read several sheets in one workbook pass;
+#'   [xlsx_sheets()] for the sheet names.
+#' @export
 read_xlsx <- function(path, sheet = 1L, col_names = TRUE, trim_ws = TRUE,
                       range = NULL, skip = 0L, n_max = Inf, col_types = NULL,
                       na = "", name_repair = c("unique", "minimal",
@@ -20,6 +70,22 @@ read_xlsx <- function(path, sheet = 1L, col_names = TRUE, trim_ws = TRUE,
     structure(out, class = "data.frame", row.names = c(NA_integer_, -n))
 }
 
+#' Read several worksheets in one pass
+#'
+#' Reads multiple sheets from an xlsx file through one shared workbook pass,
+#' so the ZIP directory, shared strings and styles are parsed once. All
+#' arguments other than `sheets` apply to every sheet read.
+#'
+#' @inheritParams read_xlsx
+#' @param sheets Sheets to read, as a vector of 1-based indices or sheet
+#'   names. `NULL` reads every sheet in workbook order.
+#' @param range As in [read_xlsx()], except a sheet-qualified range is an
+#'   error here; select sheets with `sheets`.
+#' @param name_repair As in [read_xlsx()]. A `"check_unique"` error names
+#'   the offending sheet.
+#' @return A named list of `data.frame`s, one per sheet read, named by sheet
+#'   name.
+#' @export
 read_xlsx_all <- function(path, sheets = NULL, col_names = TRUE,
                           trim_ws = TRUE, range = NULL, skip = 0L,
                           n_max = Inf, col_types = NULL, na = "",
@@ -50,22 +116,24 @@ read_xlsx_all <- function(path, sheets = NULL, col_names = TRUE,
     }, out, names(out))
 }
 
+#' List worksheet names
+#'
+#' @inheritParams read_xlsx
+#' @return A character vector of sheet names in workbook order.
+#' @export
 xlsx_sheets <- function(path) {
     path <- path.expand(path)
     if (!file.exists(path)) stop("file not found: ", path)
     .Call(C_sheet_names, path)
 }
 
-# TRUE (first row is names), FALSE (V1, V2, ...), or one name per sheet
-# column including any col_types "skip" columns, whose names are dropped
+
 parse_col_names <- function(col_names) {
     if (!is.character(col_names)) return(isTRUE(col_names))
     if (anyNA(col_names)) stop("'col_names' must not contain NA")
     col_names
 }
 
-# "unique" suffixes repeats via make.unique, "minimal" keeps names as read,
-# "check_unique" errors on any repeat
 repair_names <- function(nms, name_repair, sheet = NULL) {
     if (name_repair == "minimal") return(nms)
     if (name_repair == "check_unique") {
@@ -79,8 +147,7 @@ repair_names <- function(nms, name_repair, sheet = NULL) {
     make.unique(nms, sep = "_")
 }
 
-# strings read as NA; matched against whitespace-trimmed cell text, and
-# entries that parse as numbers also match numeric cells by value
+
 parse_na <- function(na) {
     if (is.null(na)) return(character())
     if (!is.character(na)) na <- as.character(na)
@@ -126,9 +193,7 @@ col_index <- function(s) {
     Reduce(function(a, b) a * 26L + b, as.integer(v))
 }
 
-# A1-style range: "B3:D87", "B3", "B:D", "3:87", optionally sheet-qualified
-# ("Sheet1!B3:D87", "'My Sheet'!B3:D87").  A fixed axis is one the range
-# bounds explicitly; the other keeps readxl's extent-trimming behavior.
+
 parse_range <- function(range) {
     if (!is.character(range) || length(range) != 1L || is.na(range))
         stop("'range' must be a single string like \"B3:D87\"")

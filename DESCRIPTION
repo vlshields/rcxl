@@ -11,3 +11,5 @@ License: MIT + file LICENSE
 Encoding: UTF-8
 Depends: R (>= 4.0)
 Suggests: readxl
+Roxygen: list(markdown = TRUE)
+Config/roxygen2/version: 8.1.0
