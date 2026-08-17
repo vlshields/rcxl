@@ -5,8 +5,8 @@
 #'
 #' A guessed column becomes character if it holds any string cell, logical if
 #' it holds only booleans, `POSIXct` if it holds date cells and no plain
-#' numbers, and numeric otherwise. Columns with only blank cells become
-#' logical `NA`. Date cells are returned as `POSIXct` in UTC; both the 1900
+#' numbers, and numeric otherwise. Every cell in the read area informs the
+#' guess. Columns with only blank cells become logical `NA`. Date cells are returned as `POSIXct` in UTC; both the 1900
 #' and 1904 date systems are handled, including the nonexistent 29 Feb 1900
 #' that the 1900 system counts.
 #'
