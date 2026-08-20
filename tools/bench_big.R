@@ -2,7 +2,7 @@
 # Usage: Rscript tools/bench_big.R [label]
 #   BENCH_REPS (default 5)
 # Assumes rcxl is installed into tools/lib (see tools/build.sh) and
-# tests/T_ONTIME_REPORTING.xlsx exists (see scratchpad convert script).
+# tools/bench_data/T_ONTIME_REPORTING.xlsx exists (see scratchpad convert script).
 
 lib <- file.path("tools", "lib")
 if (dir.exists(lib)) .libPaths(c(lib, .libPaths()))
@@ -10,7 +10,7 @@ suppressMessages({ library(rcxl); library(readxl) })
 
 label <- if (length(commandArgs(TRUE)) >= 1) commandArgs(TRUE)[[1]] else "big"
 reps <- as.integer(Sys.getenv("BENCH_REPS", "5"))
-path <- file.path("tests", "T_ONTIME_REPORTING.xlsx")
+path <- file.path("tools", "bench_data", "T_ONTIME_REPORTING.xlsx")
 stopifnot(file.exists(path))
 
 time_read <- function(fun, path, reps) {

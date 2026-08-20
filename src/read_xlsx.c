@@ -1408,7 +1408,9 @@ static int parse_sheet_mt(buf_t sheet, grid_t *g, const win_t *win,
     return 1;
 }
 
-/* worker count: RCXL_THREADS overrides; small sheets stay serial */
+/* worker count: RCXL_THREADS overrides; small sheets stay serial.  CRAN's
+   check farm caps packages at 2 cores and signals it via
+   _R_CHECK_LIMIT_CORES_, so the default honors that. */
 static int rcxl_nthreads(size_t sheet_bytes)
 {
     const char *e = getenv("RCXL_THREADS");
@@ -1418,7 +1420,11 @@ static int rcxl_nthreads(size_t sheet_bytes)
     }
     if (sheet_bytes < ((size_t)4 << 20)) return 1;
     int n = xthread_ncores();
-    return n > 8 ? 8 : (n < 1 ? 1 : n);
+    if (n > 8) n = 8;
+    if (n < 1) n = 1;
+    const char *lim = getenv("_R_CHECK_LIMIT_CORES_");
+    if (lim && *lim && strcmp(lim, "false") != 0 && n > 2) n = 2;
+    return n;
 }
 
 

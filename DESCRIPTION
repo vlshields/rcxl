@@ -10,6 +10,6 @@ Description: Reads tabular data from 'xlsx' files with a specialized C parser.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Depends: R (>= 4.0)
-Suggests: readxl
+Suggests: readxl, cellranger
 Roxygen: list(markdown = TRUE)
 Config/roxygen2/version: 8.1.0

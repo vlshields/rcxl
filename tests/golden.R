@@ -2,7 +2,9 @@
 #   1. hand-written asserts on handcrafted fixtures (edge/date1904/multisheet)
 #   2. snapshot comparison against tools/golden/*.rds (captured at baseline)
 #   3. tolerant cross-check against readxl on the bulk fixtures
-# Skips quietly if fixtures are absent (e.g. plain R CMD check without setup).
+# In the dev tree, fixtures come from tools/fixtures (run tools/make_fixtures.R).
+# Elsewhere (R CMD check on the built tarball) the small fixtures shipped in
+# inst/extdata are used and sections needing the generated ones skip.
 
 find_root <- function() {
   for (d in c(".", "..", "../..")) {
@@ -11,10 +13,14 @@ find_root <- function() {
   NULL
 }
 root <- find_root()
-if (is.null(root)) { cat("fixtures not found; skipping golden tests\n"); quit(save = "no") }
-fixdir <- file.path(root, "tools", "fixtures")
-lib <- file.path(root, "tools", "lib")
-if (dir.exists(lib)) .libPaths(c(lib, .libPaths()))
+if (!is.null(root)) {
+  fixdir <- file.path(root, "tools", "fixtures")
+  lib <- file.path(root, "tools", "lib")
+  if (dir.exists(lib)) .libPaths(c(lib, .libPaths()))
+} else {
+  fixdir <- system.file("extdata", package = "rcxl")
+  if (fixdir == "") { cat("fixtures not found; skipping golden tests\n"); quit(save = "no") }
+}
 library(rcxl)
 
 fails <- 0L
@@ -52,7 +58,7 @@ check(nrow(nh) == 101, "col_names=FALSE keeps header row")
 
 ## ---- 2. snapshot comparison ---------------------------------------------
 
-golddir <- file.path(root, "tools", "golden")
+golddir <- if (is.null(root)) "" else file.path(root, "tools", "golden")
 if (dir.exists(golddir)) {
   for (rds in list.files(golddir, pattern = "\\.rds$", full.names = TRUE)) {
     name <- sub("\\.rds$", "", basename(rds))
@@ -124,18 +130,20 @@ if (requireNamespace("readxl", quietly = TRUE)) {
   lim <- cellranger::cell_limits
 
   m <- fx("mixed")
-  cmp_df(read_xlsx(m, range = "B3:D10"), rdx(m, range = "B3:D10"), "range rect")
-  cmp_df(read_xlsx(m, skip = 5), rdx(m, skip = 5), "skip")
-  cmp_df(read_xlsx(m, n_max = 7), rdx(m, n_max = 7), "n_max")
-  cmp_df(read_xlsx(m, n_max = 0), rdx(m, n_max = 0), "n_max=0")
-  cmp_df(read_xlsx(m, skip = 3, n_max = 5, col_names = FALSE),
-         rdx(m, skip = 3, n_max = 5, col_names = FALSE), "skip+n_max")
-  cmp_df(read_xlsx(m, range = "B:C"),
-         rdx(m, range = lim(c(NA, 2), c(NA, 3))), "col-only range")
-  cmp_df(read_xlsx(m, range = "3:10", col_names = FALSE),
-         rdx(m, range = lim(c(3, NA), c(10, NA)), col_names = FALSE),
-         "row-only range")
-  cmp_df(read_xlsx(m, range = "B3"), rdx(m, range = "B3"), "single cell")
+  if (file.exists(m)) {
+    cmp_df(read_xlsx(m, range = "B3:D10"), rdx(m, range = "B3:D10"), "range rect")
+    cmp_df(read_xlsx(m, skip = 5), rdx(m, skip = 5), "skip")
+    cmp_df(read_xlsx(m, n_max = 7), rdx(m, n_max = 7), "n_max")
+    cmp_df(read_xlsx(m, n_max = 0), rdx(m, n_max = 0), "n_max=0")
+    cmp_df(read_xlsx(m, skip = 3, n_max = 5, col_names = FALSE),
+           rdx(m, skip = 3, n_max = 5, col_names = FALSE), "skip+n_max")
+    cmp_df(read_xlsx(m, range = "B:C"),
+           rdx(m, range = lim(c(NA, 2), c(NA, 3))), "col-only range")
+    cmp_df(read_xlsx(m, range = "3:10", col_names = FALSE),
+           rdx(m, range = lim(c(3, NA), c(10, NA)), col_names = FALSE),
+           "row-only range")
+    cmp_df(read_xlsx(m, range = "B3"), rdx(m, range = "B3"), "single cell")
+  }
 
   t <- fx("tiny")
   cmp_df(read_xlsx(t, range = "A99:C110"), rdx(t, range = "A99:C110"),
@@ -161,38 +169,41 @@ if (requireNamespace("readxl", quietly = TRUE)) {
   check(all(vapply(al, nrow, 0L) == 1) && al$Beta[[1]] == 2,
         "read_xlsx_all skip")
 
-  nm15 <- paste0("n", 1:15)
-  cmp_df(read_xlsx(m, col_names = nm15), rdx(m, col_names = nm15),
-         "character col_names")
-  cn <- read_xlsx(m, col_names = nm15)
-  check(identical(names(cn), nm15), "character col_names applied")
-  cn <- read_xlsx(m, col_names = nm15, n_max = 3)
-  check(identical(names(cn), nm15) && nrow(cn) == 3,
-        "col_names + n_max keeps header row as data")
-  cn <- read_xlsx(m, col_names = nm15,
-                  col_types = c("skip", rep("guess", 14)))
-  check(identical(names(cn), nm15[-1]), "skipped column's name is dropped")
-  cn <- read_xlsx(m, range = "B3:D10", col_names = c("p", "q", "r"))
-  check(identical(names(cn), c("p", "q", "r")) && nrow(cn) == 8,
-        "col_names sized to the range")
-  cn <- read_xlsx(m, col_names = rep("a", 15))
-  check(identical(names(cn)[1:3], c("a", "a_1", "a_2")),
-        "duplicate col_names deduplicated")
   al <- read_xlsx_all(ms, col_names = "y")
   check(all(vapply(al, names, "") == "y") && al$Beta$y[[1]] == "x",
         "read_xlsx_all character col_names")
-  check(inherits(try(read_xlsx(m, col_names = c("a", "b")), silent = TRUE),
-                 "try-error"),
-        "wrong-length col_names errors")
-  check(inherits(try(read_xlsx(m, col_names = c(nm15[-1], NA)),
-                     silent = TRUE), "try-error"),
-        "NA in col_names errors")
 
-  check(inherits(try(read_xlsx(m, range = "banana"), silent = TRUE), "try-error"),
+  nm15 <- paste0("n", 1:15)
+  if (file.exists(m)) {
+    cmp_df(read_xlsx(m, col_names = nm15), rdx(m, col_names = nm15),
+           "character col_names")
+    cn <- read_xlsx(m, col_names = nm15)
+    check(identical(names(cn), nm15), "character col_names applied")
+    cn <- read_xlsx(m, col_names = nm15, n_max = 3)
+    check(identical(names(cn), nm15) && nrow(cn) == 3,
+          "col_names + n_max keeps header row as data")
+    cn <- read_xlsx(m, col_names = nm15,
+                    col_types = c("skip", rep("guess", 14)))
+    check(identical(names(cn), nm15[-1]), "skipped column's name is dropped")
+    cn <- read_xlsx(m, range = "B3:D10", col_names = c("p", "q", "r"))
+    check(identical(names(cn), c("p", "q", "r")) && nrow(cn) == 8,
+          "col_names sized to the range")
+    cn <- read_xlsx(m, col_names = rep("a", 15))
+    check(identical(names(cn)[1:3], c("a", "a_1", "a_2")),
+          "duplicate col_names deduplicated")
+    check(inherits(try(read_xlsx(m, col_names = c("a", "b")), silent = TRUE),
+                   "try-error"),
+          "wrong-length col_names errors")
+    check(inherits(try(read_xlsx(m, col_names = c(nm15[-1], NA)),
+                       silent = TRUE), "try-error"),
+          "NA in col_names errors")
+  }
+
+  check(inherits(try(read_xlsx(t, range = "banana"), silent = TRUE), "try-error"),
         "malformed range errors")
-  check(inherits(try(read_xlsx(m, skip = -1), silent = TRUE), "try-error"),
+  check(inherits(try(read_xlsx(t, skip = -1), silent = TRUE), "try-error"),
         "negative skip errors")
-  check(inherits(try(read_xlsx(m, range = "A1:ZZZ9"), silent = TRUE), "try-error"),
+  check(inherits(try(read_xlsx(t, range = "A1:ZZZ9"), silent = TRUE), "try-error"),
         "out-of-limit column errors")
 } else cat("note: readxl not available; skipping range/skip/n_max checks\n")
 

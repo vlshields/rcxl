@@ -6,6 +6,4 @@ tools/fixtures/
 tools/golden/
 tools/bench_results/
 tools/lib/
-tests/*.csv
-tests/*.xlsx
-tests/*.zip
+tools/bench_data/
