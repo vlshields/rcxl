@@ -82,11 +82,18 @@ static const char *tag_close(const char *p, const char *end, int *self)
     return p < end ? p + 1 : end;
 }
 
+/* Attribute digits come from an untrusted archive, so an absurdly long run
+   must not overflow: saturate instead, and let the callers' range checks
+   reject the value the way they reject any other out-of-range one. */
 static long slice_long(const char *s, int len)
 {
     long v = 0;
     int i = 0;
-    for (; i < len && s[i] >= '0' && s[i] <= '9'; i++) v = v * 10 + (s[i] - '0');
+    for (; i < len && s[i] >= '0' && s[i] <= '9'; i++) {
+        int d = s[i] - '0';
+        if (v > (LONG_MAX - d) / 10) return LONG_MAX;
+        v = v * 10 + d;
+    }
     return v;
 }
 
@@ -96,9 +103,12 @@ static int ref_col(const char *s, int len)
     int c = 0, i;
     for (i = 0; i < len; i++) {
         char ch = s[i];
-        if (ch >= 'A' && ch <= 'Z') c = c * 26 + (ch - 'A' + 1);
-        else if (ch >= 'a' && ch <= 'z') c = c * 26 + (ch - 'a' + 1);
+        int d;
+        if (ch >= 'A' && ch <= 'Z') d = ch - 'A' + 1;
+        else if (ch >= 'a' && ch <= 'z') d = ch - 'a' + 1;
         else break;
+        if (c > (INT_MAX - d) / 26) { c = INT_MAX; break; }
+        c = c * 26 + d;
     }
     return c - 1;
 }
@@ -397,6 +407,45 @@ static char *slurp_file(const char *path, size_t *out_n)
     return buf;
 }
 
+/* Every zip member records a CRC-32 of its uncompressed bytes.  Extraction
+   here bypasses miniz's own reader, so the check is done here instead:
+   without it a flipped byte in a stored part reaches R as a plausible cell
+   value.  Slice-by-eight so verifying costs a fraction of inflating; the
+   table is built once from R_init_rcxl, before any worker thread exists. */
+static uint32_t crc_tab[8][256];
+
+void rcxl_crc32_init(void)
+{
+    for (unsigned n = 0; n < 256; n++) {
+        uint32_t c = n;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+        crc_tab[0][n] = c;
+    }
+    for (unsigned n = 0; n < 256; n++)
+        for (int k = 1; k < 8; k++)
+            crc_tab[k][n] = (crc_tab[k - 1][n] >> 8) ^
+                            crc_tab[0][crc_tab[k - 1][n] & 0xFF];
+}
+
+static uint32_t crc32_of(const void *buf, size_t n)
+{
+    const unsigned char *p = (const unsigned char *)buf;
+    uint32_t c = 0xFFFFFFFFu;
+    while (n >= 8) {
+        c ^= (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+             ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        p += 8;
+        n -= 8;
+        c = crc_tab[7][c & 0xFF] ^ crc_tab[6][(c >> 8) & 0xFF] ^
+            crc_tab[5][(c >> 16) & 0xFF] ^ crc_tab[4][c >> 24] ^
+            crc_tab[3][p[-4]] ^ crc_tab[2][p[-3]] ^
+            crc_tab[1][p[-2]] ^ crc_tab[0][p[-1]];
+    }
+    while (n--) c = crc_tab[0][(c ^ *p++) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
 /* zip container: miniz walks the central directory; payload bytes are
    located via the local header and inflated with libdeflate */
 typedef struct {
@@ -443,30 +492,37 @@ static const char *zpayload(const zipsrc_t *z, const mz_zip_archive_file_stat *s
     return z->data + start;
 }
 
+/* A part that is absent and one that is present but unreadable need
+   different handling: several parts are optional, and silently treating a
+   corrupt one as missing would drop shared strings or date styles. */
+enum { ZPART_CORRUPT = -1, ZPART_MISSING = 0, ZPART_OK = 1 };
+
 static int zread(zipsrc_t *z, const char *name, buf_t *out)
 {
     int idx = mz_zip_reader_locate_file(&z->za, name, NULL, 0);
-    if (idx < 0) return 0;
+    if (idx < 0) return ZPART_MISSING;
     mz_zip_archive_file_stat st;
-    if (!mz_zip_reader_file_stat(&z->za, (mz_uint)idx, &st)) return 0;
+    if (!mz_zip_reader_file_stat(&z->za, (mz_uint)idx, &st)) return ZPART_CORRUPT;
     const char *payload = zpayload(z, &st);
-    if (!payload) return 0;
+    if (!payload) return ZPART_CORRUPT;
     char *buf = scratch_alloc((size_t)st.m_uncomp_size + 1);
     if (st.m_method == 0) {
-        if (st.m_comp_size < st.m_uncomp_size) return 0;
+        if (st.m_comp_size < st.m_uncomp_size) return ZPART_CORRUPT;
         memcpy(buf, payload, (size_t)st.m_uncomp_size);
     } else if (st.m_method == 8) {
         size_t got = 0;
         if (libdeflate_deflate_decompress(z->infl, payload, (size_t)st.m_comp_size,
                                           buf, (size_t)st.m_uncomp_size, &got)
                 != LIBDEFLATE_SUCCESS || got != (size_t)st.m_uncomp_size)
-            return 0;
+            return ZPART_CORRUPT;
     } else
-        return 0;
+        return ZPART_CORRUPT;
+    if (crc32_of(buf, (size_t)st.m_uncomp_size) != st.m_crc32)
+        return ZPART_CORRUPT;
     buf[st.m_uncomp_size] = 0;
     out->p = buf;
     out->n = (size_t)st.m_uncomp_size;
-    return 1;
+    return ZPART_OK;
 }
 
 
@@ -640,7 +696,9 @@ static void parse_sst(buf_t sst, str_t **out, long *n_out, unsigned char **na_ou
             q = q2;
         }
     }
-    if (cap <= 0) cap = 1024;
+    /* uniqueCount only presizes the table, which doubles as needed, so an
+       inflated count must not turn into an inflated allocation */
+    if (cap <= 0 || cap > (1L << 20)) cap = 1024;
     str_t *arr = (str_t *)scratch_alloc((size_t)cap * sizeof(str_t));
     unsigned char *blank = (unsigned char *)scratch_alloc((size_t)cap);
     long n = 0;
@@ -791,6 +849,8 @@ typedef struct {
     long n_sst;
     int date1904;
     naset_t na;
+    const char *bad_part;  /* part that failed to extract in wb_meta; the
+                              caller reports it once the zip is closed */
 } wb_t;
 
 static void wb_open(wb_t *w, const char *cpath)
@@ -799,19 +859,28 @@ static void wb_open(wb_t *w, const char *cpath)
     scratch_reset();
     if (!zopen(&w->za, cpath))
         error("cannot open '%s' as a zip archive", cpath);
-    if (!zread(&w->za, "xl/workbook.xml", &w->wb)) {
+    int rc = zread(&w->za, "xl/workbook.xml", &w->wb);
+    if (rc != ZPART_OK) {
         zclose(&w->za);
+        if (rc == ZPART_CORRUPT)
+            error("'%s' is corrupt: cannot extract xl/workbook.xml", cpath);
         error("'%s' has no xl/workbook.xml; not an xlsx file", cpath);
     }
-    zread(&w->za, "xl/_rels/workbook.xml.rels", &w->rels);
+    if (zread(&w->za, "xl/_rels/workbook.xml.rels", &w->rels) == ZPART_CORRUPT) {
+        zclose(&w->za);
+        error("'%s' is corrupt: cannot extract xl/_rels/workbook.xml.rels",
+              cpath);
+    }
 }
 
 /* separate from wb_open so the first worksheet's inflation can overlap it */
 static void wb_meta(wb_t *w)
 {
     buf_t sstbuf = {NULL, 0}, sty = {NULL, 0};
-    zread(&w->za, "xl/sharedStrings.xml", &sstbuf);
-    zread(&w->za, "xl/styles.xml", &sty);
+    if (zread(&w->za, "xl/sharedStrings.xml", &sstbuf) == ZPART_CORRUPT)
+        w->bad_part = "xl/sharedStrings.xml";
+    else if (zread(&w->za, "xl/styles.xml", &sty) == ZPART_CORRUPT)
+        w->bad_part = "xl/styles.xml";
     w->date1904 = wb_date1904(w->wb);
     parse_styles(sty, &w->xf_date, &w->n_xf);
     parse_sst(sstbuf, &w->sst, &w->n_sst, &w->sst_na, &w->na);
@@ -1323,6 +1392,10 @@ static void read_dimension(buf_t sheet, long *rows_out, int *cols_out)
                 while (i < len && !(r2[i] >= '0' && r2[i] <= '9')) i++;
                 *rows_out = slice_long(r2 + i, len - i);
                 *cols_out = ref_col(r2, len);
+                /* the declared extent presizes the grid, so a lying or
+                   hostile <dimension> must not size it past the limits */
+                if (*rows_out > MAX_ROWS) *rows_out = MAX_ROWS;
+                if (*cols_out >= MAX_COLS) *cols_out = MAX_COLS - 1;
             }
         }
         q = q2;
@@ -1803,7 +1876,9 @@ typedef struct {
     char *out;
     size_t out_n;
     int method;
+    uint32_t crc;   /* expected, from the central directory */
     int ok;
+    int crc_bad;
 } infjob_t;
 
 static void *inflate_thread(void *arg)
@@ -1819,6 +1894,10 @@ static void *inflate_thread(void *arg)
         j->ok = libdeflate_deflate_decompress(j->infl, j->comp, j->comp_n,
                                               j->out, j->out_n, &got)
                     == LIBDEFLATE_SUCCESS && got == j->out_n;
+    }
+    if (j->ok && crc32_of(j->out, j->out_n) != j->crc) {
+        j->ok = 0;
+        j->crc_bad = 1;
     }
     return NULL;
 }
@@ -1845,6 +1924,7 @@ static int sheet_extract_start(wb_t *w, const char *target, infjob_t *ij,
     ij->out = out->p;
     ij->out_n = out->n;
     ij->method = (int)st.m_method;
+    ij->crc = st.m_crc32;
     if (allow_thread && ij->method == 8 && ij->comp_n >= ((size_t)256 << 10) &&
         rcxl_nthreads(out->n) > 1) {
         struct libdeflate_options opt = {sizeof opt, ld_malloc, ld_free};
@@ -2374,25 +2454,35 @@ static SEXP read_impl(const char *cpath, SEXP sheetsArg, SEXP namesArg,
     pthread_t ith;
     int spawned = 0;
     const char *fail = NULL;
+    int fail_crc = 0;
     if (nsel > 0 &&
         !sheet_extract_start(&w, targets, &ij, &sheets[0], &ith, &spawned, 1))
         fail = targets;
     wb_meta(&w);
+    if (!fail && w.bad_part) {
+        fail = w.bad_part;
+        fail_crc = 1;
+    }
     for (R_xlen_t i = 1; !fail && i < nsel; i++) {
         infjob_t ij2;
         pthread_t th2;
         int sp2;
         if (!sheet_extract_start(&w, targets + (size_t)i * 512, &ij2,
                                  &sheets[i], &th2, &sp2, 0) ||
-            !sheet_extract_finish(&ij2, &sheets[i], &th2, sp2))
+            !sheet_extract_finish(&ij2, &sheets[i], &th2, sp2)) {
             fail = targets + (size_t)i * 512;
+            fail_crc = ij2.crc_bad;
+        }
     }
     if (nsel > 0 && !fail &&
-        !sheet_extract_finish(&ij, &sheets[0], &ith, spawned))
+        !sheet_extract_finish(&ij, &sheets[0], &ith, spawned)) {
         fail = targets;
-    else if (spawned && fail)
+        fail_crc = ij.crc_bad;
+    } else if (spawned && fail)
         pthread_join(ith, NULL);
     zclose(&w.za);
+    if (fail_crc)
+        error("'%s' is corrupt: CRC mismatch in part '%s'", cpath, fail);
     if (fail) error("cannot extract worksheet part '%s'", fail);
 
     SEXP sst_table = PROTECT(allocVector(STRSXP, w.n_sst));
@@ -2462,8 +2552,11 @@ SEXP C_sheet_names(SEXP path)
     if (!zopen(&za, cpath))
         error("cannot open '%s' as a zip archive", cpath);
     buf_t wb = {NULL, 0};
-    if (!zread(&za, "xl/workbook.xml", &wb)) {
+    int rc = zread(&za, "xl/workbook.xml", &wb);
+    if (rc != ZPART_OK) {
         zclose(&za);
+        if (rc == ZPART_CORRUPT)
+            error("'%s' is corrupt: cannot extract xl/workbook.xml", cpath);
         error("'%s' has no xl/workbook.xml; not an xlsx file", cpath);
     }
     zclose(&za);

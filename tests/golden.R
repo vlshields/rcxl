@@ -414,44 +414,50 @@ if (file.exists(m)) {
 # so they run under R CMD check on the tarball too, where the generated
 # fixtures are absent.
 
-if (nzchar(Sys.which(Sys.getenv("R_ZIPCMD", "zip")))) {
-  hd_DECL <- '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-  hd_NS <- paste0('xmlns="http://schemas.openxmlformats.org/spreadsheetml',
-                  '/2006/main" xmlns:r="http://schemas.openxmlformats.org',
-                  '/officeDocument/2006/relationships"')
-  hd_ct <- paste0(hd_DECL, '<Types xmlns="http://schemas.openxmlformats.org',
-    '/package/2006/content-types"><Default Extension="rels" ContentType="',
-    'application/vnd.openxmlformats-package.relationships+xml"/><Default ',
-    'Extension="xml" ContentType="application/xml"/><Override PartName="',
-    '/xl/workbook.xml" ContentType="application/vnd.openxmlformats-office',
-    'document.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/works',
-    'heets/sheet1.xml" ContentType="application/vnd.openxmlformats-office',
-    'document.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles',
-    '.xml" ContentType="application/vnd.openxmlformats-officedocument.spre',
-    'adsheetml.styles+xml"/></Types>')
-  hd_rels <- function(body)
-    paste0(hd_DECL, '<Relationships xmlns="http://schemas.openxmlformats.org',
-           '/package/2006/relationships">', body, '</Relationships>')
-  hd_parts <- function(sheet) list(
-    "[Content_Types].xml" = hd_ct,
-    "_rels/.rels" = hd_rels(paste0('<Relationship Id="rId1" Type="http://sch',
-      'emas.openxmlformats.org/officeDocument/2006/relationships/officeDocum',
-      'ent" Target="xl/workbook.xml"/>')),
-    "xl/workbook.xml" = paste0(hd_DECL, '<workbook ', hd_NS, '><sheets><sheet',
-      ' name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'),
-    "xl/_rels/workbook.xml.rels" = hd_rels(paste0(
-      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/offic',
-      'eDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml',
-      '"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/of',
-      'ficeDocument/2006/relationships/styles" Target="styles.xml"/>')),
-    # xf 1 is numFmtId 22, a builtin date-time format
-    "xl/styles.xml" = paste0(hd_DECL, '<styleSheet ', hd_NS, '><fonts count=',
-      '"1"><font/></fonts><fills count="1"><fill/></fills><borders count="1">',
-      '<border/></borders><cellStyleXfs count="1"><xf numFmtId="0"/></cellSty',
-      'leXfs><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="22" applyNumb',
-      'erFormat="1"/></cellXfs></styleSheet>'),
-    "xl/worksheets/sheet1.xml" = sheet)
+hd_DECL <- '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+hd_NS <- paste0('xmlns="http://schemas.openxmlformats.org/spreadsheetml',
+                '/2006/main" xmlns:r="http://schemas.openxmlformats.org',
+                '/officeDocument/2006/relationships"')
+hd_ct <- paste0(hd_DECL, '<Types xmlns="http://schemas.openxmlformats.org',
+  '/package/2006/content-types"><Default Extension="rels" ContentType="',
+  'application/vnd.openxmlformats-package.relationships+xml"/><Default ',
+  'Extension="xml" ContentType="application/xml"/><Override PartName="',
+  '/xl/workbook.xml" ContentType="application/vnd.openxmlformats-office',
+  'document.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/works',
+  'heets/sheet1.xml" ContentType="application/vnd.openxmlformats-office',
+  'document.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles',
+  '.xml" ContentType="application/vnd.openxmlformats-officedocument.spre',
+  'adsheetml.styles+xml"/></Types>')
+hd_rels <- function(body)
+  paste0(hd_DECL, '<Relationships xmlns="http://schemas.openxmlformats.org',
+         '/package/2006/relationships">', body, '</Relationships>')
+hd_parts <- function(sheet) list(
+  "[Content_Types].xml" = hd_ct,
+  "_rels/.rels" = hd_rels(paste0('<Relationship Id="rId1" Type="http://sch',
+    'emas.openxmlformats.org/officeDocument/2006/relationships/officeDocum',
+    'ent" Target="xl/workbook.xml"/>')),
+  "xl/workbook.xml" = paste0(hd_DECL, '<workbook ', hd_NS, '><sheets><sheet',
+    ' name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'),
+  "xl/_rels/workbook.xml.rels" = hd_rels(paste0(
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/offic',
+    'eDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml',
+    '"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/of',
+    'ficeDocument/2006/relationships/styles" Target="styles.xml"/>')),
+  # xf 1 is numFmtId 22, a builtin date-time format
+  "xl/styles.xml" = paste0(hd_DECL, '<styleSheet ', hd_NS, '><fonts count=',
+    '"1"><font/></fonts><fills count="1"><fill/></fills><borders count="1">',
+    '<border/></borders><cellStyleXfs count="1"><xf numFmtId="0"/></cellSty',
+    'leXfs><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="22" applyNumb',
+    'erFormat="1"/></cellXfs></styleSheet>'),
+  "xl/worksheets/sheet1.xml" = sheet)
+hd_sheet <- function(body)
+  paste0(hd_DECL, '<worksheet ', hd_NS, '><sheetData>', body,
+         '</sheetData></worksheet>')
+hd_hdr <- function(nm)
+  paste0('<row r="1"><c r="A1" t="inlineStr"><is><t>', nm,
+         '</t></is></c></row>')
 
+if (nzchar(Sys.which(Sys.getenv("R_ZIPCMD", "zip")))) {
   # sheet may be a character scalar or a raw vector (for invalid-UTF-8 bytes)
   hd_write <- function(name, sheet) {
     td <- file.path(tempdir(), paste0("hd_", name))
@@ -473,12 +479,6 @@ if (nzchar(Sys.which(Sys.getenv("R_ZIPCMD", "zip")))) {
     utils::zip(p, ".", flags = "-r9Xq")
     p
   }
-  hd_sheet <- function(body)
-    paste0(hd_DECL, '<worksheet ', hd_NS, '><sheetData>', body,
-           '</sheetData></worksheet>')
-  hd_hdr <- function(nm)
-    paste0('<row r="1"><c r="A1" t="inlineStr"><is><t>', nm,
-           '</t></is></c></row>')
 
   # 8a. a whole second must survive as a whole second.  The day fraction has
   # no exact binary form, so an unrounded conversion lands just under the
@@ -625,6 +625,166 @@ if (file.exists(lo)) {
         identical(names(flr), c("YEAR", "FL_DATE", "OP_UNIQUE_CARRIER")),
         "libreoffice: range read")
 } else cat("note: flights.xlsx fixture missing; skipping LibreOffice checks\n")
+
+## ---- 10. archive integrity: member CRC-32 -------------------------------
+# Parts are extracted straight out of the mapped file rather than through
+# miniz's own reader, so the CRC-32 each zip member records has to be checked
+# on the way out. These archives are assembled byte by byte in R with stored
+# (uncompressed) members, so a payload byte can be flipped while the recorded
+# CRC stays put -- the silent-corruption case -- and no zip command is needed.
+
+crc_le16 <- function(x) as.raw(bitwAnd(bitwShiftR(x, 8L * (0:1)), 255L))
+crc_le32 <- function(x) as.raw(bitwAnd(bitwShiftR(x, 8L * (0:3)), 255L))
+
+# base R has no crc32(), but a gzip stream carries one in its last 8 bytes
+crc_of <- function(bytes) {
+  f <- tempfile()
+  con <- gzfile(f, "wb")
+  writeBin(bytes, con)
+  close(con)
+  g <- readBin(f, "raw", file.size(f))
+  unlink(f)
+  g[length(g) - 7L:4L]
+}
+
+# tweak: named list of functions applied to a part's bytes *after* its CRC is
+# taken, so the archive carries a correct CRC over the pre-tweak content
+crc_zip <- function(path, parts, tweak = list()) {
+  local <- raw(0)
+  central <- raw(0)
+  for (nm in names(parts)) {
+    body <- parts[[nm]]
+    if (!is.raw(body)) body <- charToRaw(body)
+    crc <- crc_of(body)
+    if (!is.null(tweak[[nm]])) body <- tweak[[nm]](body)
+    nmr <- charToRaw(nm)
+    n <- length(body)
+    off <- length(local)
+    local <- c(local,
+      as.raw(c(0x50, 0x4b, 0x03, 0x04)), crc_le16(20L), crc_le16(0L),
+      crc_le16(0L), crc_le16(0L), crc_le16(0L), crc, crc_le32(n),
+      crc_le32(n), crc_le16(length(nmr)), crc_le16(0L), nmr, body)
+    central <- c(central,
+      as.raw(c(0x50, 0x4b, 0x01, 0x02)), crc_le16(20L), crc_le16(20L),
+      crc_le16(0L), crc_le16(0L), crc_le16(0L), crc_le16(0L), crc,
+      crc_le32(n), crc_le32(n), crc_le16(length(nmr)), crc_le16(0L),
+      crc_le16(0L), crc_le16(0L), crc_le16(0L), crc_le32(0L),
+      crc_le32(off), nmr)
+  }
+  writeBin(c(local, central,
+    as.raw(c(0x50, 0x4b, 0x05, 0x06)), crc_le16(0L), crc_le16(0L),
+    crc_le16(length(parts)), crc_le16(length(parts)),
+    crc_le32(length(central)), crc_le32(length(local)), crc_le16(0L)), path)
+  path
+}
+
+crc_path <- function(name) file.path(tempdir(), paste0("crc_", name, ".xlsx"))
+# 1.5 -> 9.5 in the stored bytes: a value change no XML check would notice
+crc_bend <- function(body) {
+  at <- gregexpr("1.5", rawToChar(body), fixed = TRUE)[[1]][1]
+  body[at] <- charToRaw("9")
+  body
+}
+crc_bite <- function(body) {
+  body[length(body) %/% 2L] <- as.raw(bitwXor(as.integer(body[length(body) %/% 2L]), 1L))
+  body
+}
+
+crc_sheet <- hd_sheet(paste0(hd_hdr("x"),
+  '<row r="2"><c r="A2"><v>1.5</v></c></row>'))
+crc_parts <- c(hd_parts(crc_sheet),
+  list("xl/sharedStrings.xml" = paste0(hd_DECL, '<sst ', hd_NS,
+       ' count="1" uniqueCount="1"><si><t>alpha</t></si></sst>')))
+
+# 10a. the stored-member archive itself must read, or the corruption checks
+# below would pass for the wrong reason
+crc_good <- crc_zip(crc_path("good"), crc_parts)
+crc_d <- try(read_xlsx(crc_good), silent = TRUE)
+check(!inherits(crc_d, "try-error") && identical(crc_d$x, 1.5),
+      "crc: stored-member archive reads")
+check(identical(try(xlsx_sheets(crc_good), silent = TRUE), "Sheet1"),
+      "crc: stored-member sheet names")
+
+# 10b. control: the same flip with the CRC taken over the flipped bytes. The
+# cell reads 9.5 and every other check in the reader is happy with it, which
+# is exactly why the CRC is the only thing standing between 10c and silence.
+crc_ctl <- hd_parts(rawToChar(crc_bend(charToRaw(crc_sheet))))
+crc_d <- try(read_xlsx(crc_zip(crc_path("control"), crc_ctl)), silent = TRUE)
+check(!inherits(crc_d, "try-error") && identical(crc_d$x, 9.5),
+      "crc: control -- flipped byte is invisible once the CRC agrees")
+
+# 10c. a flipped worksheet byte changes a cell value with nothing else to
+# give it away; only the member CRC catches it
+crc_bad <- crc_zip(crc_path("sheet"), crc_parts,
+                   list("xl/worksheets/sheet1.xml" = crc_bend))
+crc_e <- try(read_xlsx(crc_bad), silent = TRUE)
+check(inherits(crc_e, "try-error"), "crc: corrupt worksheet errors")
+if (inherits(crc_e, "try-error"))
+  check(grepl("corrupt", crc_e), "crc: corrupt worksheet says so")
+
+# 10d. the optional parts must not be silently skipped when they are corrupt:
+# dropping sharedStrings would turn every shared cell into NA
+for (crc_part in c("xl/sharedStrings.xml", "xl/styles.xml",
+                   "xl/_rels/workbook.xml.rels", "xl/workbook.xml")) {
+  crc_bad <- crc_zip(crc_path("part"), crc_parts,
+                     setNames(list(crc_bite), crc_part))
+  crc_e <- try(read_xlsx(crc_bad), silent = TRUE)
+  check(inherits(crc_e, "try-error") && grepl("corrupt", crc_e),
+        paste0("crc: corrupt ", crc_part, " errors in read_xlsx"))
+}
+
+# 10e. xlsx_sheets extracts the workbook part on its own path
+crc_bad <- crc_zip(crc_path("names"), crc_parts,
+                   list("xl/workbook.xml" = crc_bite))
+crc_e <- try(xlsx_sheets(crc_bad), silent = TRUE)
+check(inherits(crc_e, "try-error") && grepl("corrupt", crc_e),
+      "crc: corrupt workbook errors in xlsx_sheets")
+
+## ---- 11. hardening: oversized integers in untrusted XML ------------------
+# Row numbers, column refs, the declared dimension and uniqueCount all come
+# from the archive and all feed sizing decisions, so a digit run long enough
+# to overflow the accumulator must saturate into a rejected value rather than
+# wrap into a small (or negative) one.
+
+crc_ovf <- function(name, sheet, extra = list()) {
+  crc_zip(crc_path(name), c(hd_parts(sheet), extra))
+}
+
+# 11a. a row number too long to fit in a long: rejected like any other row
+# past the sheet limit, not wrapped into one inside it
+ov <- try(read_xlsx(crc_ovf("row", hd_sheet(paste0(hd_hdr("x"),
+  '<row r="99999999999999999999999999"><c r="A2"><v>1</v></c></row>')))),
+  silent = TRUE)
+check(inherits(ov, "try-error") && grepl("1048576", ov),
+      "overflow: absurd row number rejected")
+
+# 11b. a column ref of 40 letters: past the sheet width, so the cell is
+# dropped and the read still completes
+ov <- try(read_xlsx(crc_ovf("col", hd_sheet(paste0(hd_hdr("x"),
+  '<row r="2"><c r="A2"><v>1</v></c><c r="', strrep("Z", 40),
+  '2"><v>2</v></c></row>')))), silent = TRUE)
+check(!inherits(ov, "try-error") && identical(ov$x, 1) && ncol(ov) == 1,
+      "overflow: absurd column ref dropped, read completes")
+
+# 11c. <dimension> presizes the grid, so an absurd extent must be clamped to
+# the sheet limits instead of sizing an allocation from it
+ov <- try(read_xlsx(crc_ovf("dim", paste0(hd_DECL, '<worksheet ', hd_NS,
+  '><dimension ref="A1:', strrep("Z", 30), '99999999999999999999"/><sheetData>',
+  hd_hdr("x"), '<row r="2"><c r="A2"><v>1</v></c></row>',
+  '</sheetData></worksheet>'))), silent = TRUE)
+check(!inherits(ov, "try-error") && identical(ov$x, 1),
+      "overflow: absurd <dimension> clamped")
+
+# 11d. uniqueCount only presizes the shared-string table, which grows on its
+# own, so an absurd count must not become an absurd allocation
+ov <- try(read_xlsx(crc_ovf("sst", hd_sheet(paste0(
+  '<row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row>',
+  '<row r="2"><c r="A2" t="s"><v>0</v></c></row>')),
+  list("xl/sharedStrings.xml" = paste0(hd_DECL, '<sst ', hd_NS,
+       ' count="1" uniqueCount="99999999999999999999"><si><t>alpha</t></si>',
+       '</sst>')))), silent = TRUE)
+check(!inherits(ov, "try-error") && identical(ov$x, "alpha"),
+      "overflow: absurd uniqueCount ignored")
 
 if (fails > 0L) stop(fails, " golden check(s) failed")
 cat("all golden checks passed\n")

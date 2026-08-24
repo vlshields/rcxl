@@ -7,3 +7,5 @@ tools/golden/
 tools/bench_results/
 tools/lib/
 tools/bench_data/
+*.Rcheck/
+*.tar.gz
