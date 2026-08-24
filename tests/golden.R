@@ -551,7 +551,80 @@ if (nzchar(Sys.which(Sys.getenv("R_ZIPCMD", "zip")))) {
                    "' errors in xlsx_sheets"))
     }
   }
+
+  # 8f. every shipped fixture is far below the 4 MB threaded threshold, so
+  # without this the threaded parser and its chunk merge never run under
+  # R CMD check. RCXL_THREADS bypasses the threshold; a sheet with a few
+  # thousand mixed rows is read serially and threaded and must agree exactly.
+  # Multibyte strings ensure a chunk boundary can land inside a UTF-8
+  # sequence; _R_CHECK_LIMIT_CORES_ permits the 2 workers asked for.
+  hd_n <- 5000L
+  hd_i <- seq_len(hd_n)
+  hd_bool <- ifelse(hd_i %% 3L == 0L,
+                    paste0('<c r="D', hd_i + 1L, '" t="b"><v>',
+                           hd_i %% 2L, '</v></c>'), "")
+  p <- hd_write("mt", hd_sheet(paste0(
+    '<row r="1">',
+    '<c r="A1" t="inlineStr"><is><t>num</t></is></c>',
+    '<c r="B1" t="inlineStr"><is><t>txt</t></is></c>',
+    '<c r="C1" t="inlineStr"><is><t>when</t></is></c>',
+    '<c r="D1" t="inlineStr"><is><t>flag</t></is></c></row>',
+    paste0('<row r="', hd_i + 1L, '">',
+           '<c r="A', hd_i + 1L, '"><v>', hd_i, '.5</v></c>',
+           '<c r="B', hd_i + 1L, '" t="inlineStr"><is><t>ré', hd_i,
+           '€</t></is></c>',
+           '<c r="C', hd_i + 1L, '" s="1"><v>', 40000L + hd_i %% 1000L,
+           '</v></c>', hd_bool, '</row>', collapse = ""))))
+  hd_thr <- Sys.getenv("RCXL_THREADS", unset = NA)
+  Sys.setenv(RCXL_THREADS = "1")
+  hd_ser <- read_xlsx(p)
+  Sys.setenv(RCXL_THREADS = "2")
+  hd_par <- read_xlsx(p)
+  if (is.na(hd_thr)) Sys.unsetenv("RCXL_THREADS") else
+    Sys.setenv(RCXL_THREADS = hd_thr)
+  check(identical(hd_ser, hd_par),
+        "hardening: threaded read identical to serial")
+  check(nrow(hd_par) == hd_n && identical(sum(hd_par$num),
+        hd_n * (hd_n + 1) / 2 + hd_n * 0.5), "hardening: threaded numerics")
+  check(all(validUTF8(hd_par$txt)) &&
+        identical(hd_par$txt[hd_n], paste0("ré", hd_n, "€")),
+        "hardening: threaded multibyte strings")
+  check(inherits(hd_par$when, "POSIXct") && !anyNA(hd_par$when),
+        "hardening: threaded date column")
+  check(is.logical(hd_par$flag) &&
+        sum(!is.na(hd_par$flag)) == hd_n %/% 3L,
+        "hardening: threaded bools and blanks")
 } else cat("note: no zip command available; skipping hardening checks\n")
+
+## ---- 9. foreign writer: LibreOffice Calc ---------------------------------
+# flights.xlsx was saved by LibreOffice (sharedStrings, style-driven dates,
+# its own styles.xml), not by rcxl's fixture generator, so these checks read
+# a dialect no other part of the suite produces.
+lo <- if (is.null(root)) fx("flights") else
+  file.path(root, "inst", "extdata", "flights.xlsx")
+if (file.exists(lo)) {
+  fl <- read_xlsx(lo)
+  check(identical(names(fl), c("YEAR", "FL_DATE", "OP_UNIQUE_CARRIER",
+        "TAIL_NUM", "ORIGIN", "ORIGIN_CITY_NAME", "DEP_TIME", "DEP_DELAY",
+        "DEP_DEL15", "ARR_DELAY_NEW")), "libreoffice: names")
+  check(nrow(fl) == 100, "libreoffice: nrow")
+  check(inherits(fl$FL_DATE, "POSIXct") &&
+        all(fl$FL_DATE == utc("2026-01-01")), "libreoffice: date column")
+  check(is.numeric(fl$YEAR) && all(fl$YEAR == 2026), "libreoffice: numeric column")
+  check(identical(fl$DEP_DELAY[1:4], c(85, 71, 27, 1)), "libreoffice: values")
+  check(identical(fl$TAIL_NUM[1], "N101NN"), "libreoffice: shared string")
+  check("Dallas/Fort Worth, TX" %in% fl$ORIGIN_CITY_NAME,
+        "libreoffice: shared string with comma")
+  check(sum(is.na(fl$ARR_DELAY_NEW)) == 1 && !anyNA(fl[-10]),
+        "libreoffice: blank cell placement")
+  flt <- read_xlsx(lo, col_types = "text")
+  check(all(vapply(flt, is.character, NA)) &&
+        identical(flt$DEP_DELAY[1], "85"), "libreoffice: forced text")
+  flr <- read_xlsx(lo, range = "A1:C5")
+  check(identical(dim(flr), c(4L, 3L)) &&
+        identical(names(flr), c("YEAR", "FL_DATE", "OP_UNIQUE_CARRIER")),
+        "libreoffice: range read")
+} else cat("note: flights.xlsx fixture missing; skipping LibreOffice checks\n")
 
 if (fails > 0L) stop(fails, " golden check(s) failed")
 cat("all golden checks passed\n")
