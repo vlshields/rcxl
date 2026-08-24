@@ -47,6 +47,19 @@
 #' @return A `data.frame` with one column per worksheet column read.
 #' @seealso [read_xlsx_all()] to read several sheets in one workbook pass;
 #'   [xlsx_sheets()] for the sheet names.
+#' @examples
+#' types <- system.file("extdata", "types.xlsx", package = "rcxl")
+#' str(read_xlsx(types))
+#'
+#' # read a rectangle rather than the whole sheet
+#' read_xlsx(types, range = "A1:C3")
+#'
+#' # force every column to character instead of guessing
+#' str(read_xlsx(types, col_types = "text"))
+#'
+#' # a sheet other than the first, by name or by position
+#' multi <- system.file("extdata", "multisheet.xlsx", package = "rcxl")
+#' read_xlsx(multi, sheet = "Beta")
 #' @export
 read_xlsx <- function(path, sheet = 1L, col_names = TRUE, trim_ws = TRUE,
                       range = NULL, skip = 0L, n_max = Inf, col_types = NULL,
@@ -85,6 +98,14 @@ read_xlsx <- function(path, sheet = 1L, col_names = TRUE, trim_ws = TRUE,
 #'   the offending sheet.
 #' @return A named list of `data.frame`s, one per sheet read, named by sheet
 #'   name.
+#' @examples
+#' multi <- system.file("extdata", "multisheet.xlsx", package = "rcxl")
+#' sheets <- read_xlsx_all(multi)
+#' names(sheets)
+#' sheets[["Alpha"]]
+#'
+#' # a subset of the sheets, still in one workbook pass
+#' names(read_xlsx_all(multi, sheets = c("Alpha", "Gamma")))
 #' @export
 read_xlsx_all <- function(path, sheets = NULL, col_names = TRUE,
                           trim_ws = TRUE, range = NULL, skip = 0L,
@@ -120,6 +141,8 @@ read_xlsx_all <- function(path, sheets = NULL, col_names = TRUE,
 #'
 #' @inheritParams read_xlsx
 #' @return A character vector of sheet names in workbook order.
+#' @examples
+#' xlsx_sheets(system.file("extdata", "multisheet.xlsx", package = "rcxl"))
 #' @export
 xlsx_sheets <- function(path) {
     path <- path.expand(path)

@@ -2,3 +2,6 @@
 ^\.gitignore$
 ^.*\.o$
 ^src/.*\.so$
+^USAGE\.md$
+^readme\.R$
+^cran-comments\.md$

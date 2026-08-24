@@ -124,6 +124,94 @@ static int utf8_put(unsigned int cp, char *out)
     return 4;
 }
 
+/* Worksheet text is declared UTF-8 by the format, but nothing enforces it.
+   Handing R a CE_UTF8 string with invalid bytes makes nchar(), substr() and
+   toupper() throw on the returned data frame, so bad bytes are repaired
+   rather than passed through. */
+static int utf8_seq_len(const unsigned char *p, const unsigned char *e,
+                        unsigned int *cp)
+{
+    unsigned char c = *p;
+    int len;
+    if (c < 0x80) { *cp = c; return 1; }
+    if ((c & 0xE0) == 0xC0) { len = 2; *cp = c & 0x1Fu; }
+    else if ((c & 0xF0) == 0xE0) { len = 3; *cp = c & 0x0Fu; }
+    else if ((c & 0xF8) == 0xF0) { len = 4; *cp = c & 0x07u; }
+    else return 0;
+    if (e - p < len) return 0;
+    for (int i = 1; i < len; i++) {
+        if ((p[i] & 0xC0) != 0x80) return 0;
+        *cp = (*cp << 6) | (unsigned)(p[i] & 0x3F);
+    }
+    if (*cp > 0x10FFFF || (*cp >= 0xD800 && *cp <= 0xDFFF)) return 0;
+    /* overlong encodings decode to a valid scalar but are not valid UTF-8 */
+    if ((len == 2 && *cp < 0x80) || (len == 3 && *cp < 0x800) ||
+        (len == 4 && *cp < 0x10000)) return 0;
+    return len;
+}
+
+static int utf8_valid(const char *s, int n)
+{
+    const unsigned char *p = (const unsigned char *)s, *e = p + n;
+    while (p < e) {
+        /* worksheet text is overwhelmingly ASCII: clear it eight bytes at a
+           time and only decode where a high bit actually appears */
+        while (e - p >= 8) {
+            uint64_t w;
+            memcpy(&w, p, 8);
+            if (w & 0x8080808080808080ULL) break;
+            p += 8;
+        }
+        if (p >= e) break;
+        if (*p < 0x80) { p++; continue; }
+        unsigned int cp;
+        int len = utf8_seq_len(p, e, &cp);
+        if (!len) return 0;
+        p += len;
+    }
+    return 1;
+}
+
+/* each invalid byte becomes U+FFFD; only reached when utf8_valid fails */
+static str_t utf8_sanitize(const char *s, int n)
+{
+    str_t out;
+    char *buf = R_alloc((size_t)n * 3 + 1, 1);
+    char *d = buf;
+    const unsigned char *p = (const unsigned char *)s, *e = p + n;
+    while (p < e) {
+        unsigned int cp;
+        int len = utf8_seq_len(p, e, &cp);
+        if (!len) { d += utf8_put(0xFFFD, d); p++; continue; }
+        memcpy(d, p, (size_t)len);
+        d += len;
+        p += len;
+    }
+    out.p = buf;
+    out.n = (int)(d - buf);
+    return out;
+}
+
+/* R string from worksheet bytes, repairing invalid UTF-8 */
+static SEXP mk_utf8(const char *p, int n)
+{
+    if (n <= 0) return mkCharLenCE(p ? p : "", 0, CE_UTF8);
+    if (utf8_valid(p, n)) return mkCharLenCE(p, n, CE_UTF8);
+    str_t s = utf8_sanitize(p, n);
+    return mkCharLenCE(s.p, s.n, CE_UTF8);
+}
+
+/* Excel serial -> seconds since the R epoch.  The 1900 system counts a
+   nonexistent 1900-02-29, so serials before it run a day behind the real
+   calendar.  The day fraction is a base-10 value with no exact binary form,
+   so snap to the nearest millisecond: left alone, a whole second arrives as
+   ...:55.999999 and formats one second early. */
+static double serial_seconds(double serial, double epoch, int date1904)
+{
+    if (!date1904 && serial < 61.0) serial += 1.0;
+    return round((serial - epoch) * 86400.0 * 1000.0) / 1000.0;
+}
+
 static int unescape_into(const char *s, int len, char *dst)
 {
     const char *end = s + len;
@@ -139,24 +227,36 @@ static int unescape_into(const char *s, int len, char *dst)
         else if (rem >= 4 && s[1] == '#') {
             const char *q = s + 2;
             unsigned int cp = 0;
+            int ndig = 0, ok = 1;
             if (*q == 'x' || *q == 'X') {
                 q++;
-                while (q < end && *q != ';') {
-                    char c = *q++;
+                while (q < end && *q != ';' && ok) {
+                    char c = *q;
                     cp <<= 4;
                     if (c >= '0' && c <= '9') cp |= (unsigned)(c - '0');
                     else if (c >= 'a' && c <= 'f') cp |= (unsigned)(c - 'a' + 10);
                     else if (c >= 'A' && c <= 'F') cp |= (unsigned)(c - 'A' + 10);
+                    else ok = 0;
+                    if (ok && ++ndig > 6) ok = 0;
+                    if (ok) q++;
                 }
             } else {
-                while (q < end && *q != ';') {
+                while (q < end && *q != ';' && ok) {
                     if (*q >= '0' && *q <= '9') cp = cp * 10 + (unsigned)(*q - '0');
-                    q++;
+                    else ok = 0;
+                    if (ok && ++ndig > 7) ok = 0;
+                    if (ok) q++;
                 }
             }
-            if (q < end) q++;
-            d += utf8_put(cp, d);
-            s = q;
+            /* a character reference must terminate and name a real scalar
+               value; a malformed one is literal text, not a NUL byte */
+            if (!ok || ndig == 0 || q >= end || *q != ';' || cp == 0 ||
+                cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+                *d++ = *s++;
+            } else {
+                d += utf8_put(cp, d);
+                s = q + 1;
+            }
         }
         else *d++ = *s++;
     }
@@ -901,6 +1001,7 @@ typedef struct {
 #define CNT_STR 3
 #define CNT_NONBLANK 4
 #define MAX_COLS 16384
+#define MAX_ROWS 1048576
 
 typedef struct {
     const char *begin, *end;
@@ -918,6 +1019,7 @@ typedef struct {
     int flt_c0, flt_c1;        /* window cols [c0,c1); c1<0: open */
     int can_grow;              /* serial mode: may allocate through R */
     int fail;                  /* threaded bail: rerun serially */
+    long bad_row;              /* row number past MAX_ROWS, 0 if none */
 } chunk_t;
 
 static void chunk_extent(chunk_t *ck, int col, R_xlen_t row)
@@ -994,6 +1096,13 @@ static void parse_rows(chunk_t *ck)
             q = q2;
         }
         p = tag_close(q, end, &self);
+        /* a row number past the sheet limit is malformed; left alone it
+           sizes every column array from the bogus extent */
+        if (rnum > MAX_ROWS) {
+            if (!ck->can_grow) { ck->fail = 1; return; }
+            ck->bad_row = rnum;
+            return;
+        }
         if (rnum > 0)
             cur_row = rnum - 1;
         else {
@@ -1302,6 +1411,9 @@ static void parse_sheet_serial(buf_t sheet, grid_t *g, const win_t *win,
     ck.sst_used = sst_used;   /* serial: write the shared map directly */
     ck.can_grow = 1;
     parse_rows(&ck);
+    if (ck.bad_row)
+        error("row number %ld exceeds the xlsx limit of %d", ck.bad_row,
+              MAX_ROWS);
     merge_chunk(g, &ck, NULL, 0);
 }
 
@@ -1413,15 +1525,19 @@ static int parse_sheet_mt(buf_t sheet, grid_t *g, const win_t *win,
    _R_CHECK_LIMIT_CORES_, so the default honors that. */
 static int rcxl_nthreads(size_t sheet_bytes)
 {
+    int n;
     const char *e = getenv("RCXL_THREADS");
     if (e && *e) {
         long v = strtol(e, NULL, 10);
-        if (v >= 1) return v > 64 ? 64 : (int)v;
+        n = v < 1 ? 1 : (v > 64 ? 64 : (int)v);
+    } else {
+        if (sheet_bytes < ((size_t)4 << 20)) return 1;
+        n = xthread_ncores();
+        if (n > 8) n = 8;
+        if (n < 1) n = 1;
     }
-    if (sheet_bytes < ((size_t)4 << 20)) return 1;
-    int n = xthread_ncores();
-    if (n > 8) n = 8;
-    if (n < 1) n = 1;
+    /* the cap applies to an explicit RCXL_THREADS too: otherwise the setting
+       sitting in someone's ~/.Renviron follows them into R CMD check */
     const char *lim = getenv("_R_CHECK_LIMIT_CORES_");
     if (lim && *lim && strcmp(lim, "false") != 0 && n > 2) n = 2;
     return n;
@@ -1440,7 +1556,7 @@ static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_ss
     }
     case CELL_STR: {
         str_t s = trim ? str_trim(c->str[row]) : c->str[row];
-        return mkCharLenCE(s.p, s.n, CE_UTF8);
+        return mk_utf8(s.p, s.n);
     }
     case CELL_STR_RAW:
     case CELL_IS_RAW: {
@@ -1452,7 +1568,7 @@ static SEXP cell_charsxp(const col_t *c, R_xlen_t row, SEXP sst_table, long n_ss
         str_t st = str_trim(s);
         if (na_match(na, st)) return NA_STRING;
         if (trim) s = st;
-        return mkCharLenCE(s.p, s.n, CE_UTF8);
+        return mk_utf8(s.p, s.n);
     }
     case CELL_NUM:
     case CELL_DATE: {
@@ -1581,9 +1697,8 @@ static void force_col_main(const wb_t *w, SEXP col, const col_t *c, int t,
                 v = ScalarReal(c->num[r]);
                 break;
             case CELL_DATE: {
-                double serial = c->num[r];
-                if (!date1904 && serial < 61.0) serial += 1.0;
-                v = PROTECT(ScalarReal((serial - epoch) * 86400.0));
+                v = PROTECT(ScalarReal(
+                        serial_seconds(c->num[r], epoch, date1904)));
                 setAttrib(v, R_ClassSymbol, dklass);
                 setAttrib(v, install("tzone"), tz);
                 UNPROTECT(1);
@@ -1656,9 +1771,7 @@ static void force_col_main(const wb_t *w, SEXP col, const col_t *c, int t,
         default:   /* COL_DATE; strings never parse as dates */
             /* Excel has no negative serials; such values are not dates */
             if ((tg == CELL_DATE || tg == CELL_NUM) && c->num[r] >= 0.0) {
-                double serial = c->num[r];
-                if (!date1904 && serial < 61.0) serial += 1.0;
-                dp[i] = (serial - epoch) * 86400.0;
+                dp[i] = serial_seconds(c->num[r], epoch, date1904);
             } else if (tg == CELL_NUM || tg == CELL_DATE) {
                 dp[i] = NA_REAL;
                 fail = 1;
@@ -1798,11 +1911,8 @@ static void fill_one(const filljob_t *j)
                 j->dp[r - data0] = NA_REAL;
                 continue;
             }
-            double serial = c->num[r];
-            /* Excel's 1900 system counts a nonexistent 1900-02-29;
-               serials before it are one day behind the real calendar. */
-            if (!j->date1904 && serial < 61.0) serial += 1.0;
-            j->dp[r - data0] = (serial - j->epoch) * 86400.0;
+            j->dp[r - data0] =
+                serial_seconds(c->num[r], j->epoch, j->date1904);
         }
         break;
     case FILL_LGL:
@@ -1826,9 +1936,8 @@ static void fill_one(const filljob_t *j)
             unsigned char tg = cell_tag(c, r);
             /* Excel has no negative serials; such values are not dates */
             if ((tg == CELL_DATE || tg == CELL_NUM) && c->num[r] >= 0.0) {
-                double serial = c->num[r];
-                if (!j->date1904 && serial < 61.0) serial += 1.0;
-                j->dp[r - data0] = (serial - j->epoch) * 86400.0;
+                j->dp[r - data0] =
+                    serial_seconds(c->num[r], j->epoch, j->date1904);
             } else {
                 j->dp[r - data0] = NA_REAL;
                 if (tg == CELL_BOOL || tg == CELL_NUM || tg == CELL_DATE)
@@ -1896,7 +2005,7 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, SEXP namesArg,
     for (long i = 0; i < n_sst; i++) {
         if (!sst_used[i] || sst_interned[i]) continue;
         str_t s = trim ? str_trim(w->sst[i]) : w->sst[i];
-        SET_STRING_ELT(sst_table, i, mkCharLenCE(s.p, s.n, CE_UTF8));
+        SET_STRING_ELT(sst_table, i, mk_utf8(s.p, s.n));
         sst_interned[i] = 1;
     }
 
@@ -2295,7 +2404,7 @@ static SEXP read_impl(const char *cpath, SEXP sheetsArg, SEXP namesArg,
     SEXP onms = PROTECT(allocVector(STRSXP, nsel));
     for (R_xlen_t i = 0; i < nsel; i++) {
         str_t dec = xml_unescape(names[i].p, names[i].n);
-        SET_STRING_ELT(onms, i, mkCharLenCE(dec.p, dec.n, CE_UTF8));
+        SET_STRING_ELT(onms, i, mk_utf8(dec.p, dec.n));
     }
     for (R_xlen_t i = 0; i < nsel; i++)
         SET_VECTOR_ELT(out, i,
@@ -2378,7 +2487,7 @@ SEXP C_sheet_names(SEXP path)
             q = q2;
         }
         str_t dec = xml_unescape(nm.p, nm.n);
-        SET_STRING_ELT(ans, i++, mkCharLenCE(dec.p, dec.n, CE_UTF8));
+        SET_STRING_ELT(ans, i++, mk_utf8(dec.p, dec.n));
     }
     UNPROTECT(1);
     return ans;

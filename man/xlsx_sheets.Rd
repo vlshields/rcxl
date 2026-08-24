@@ -15,3 +15,6 @@ A character vector of sheet names in workbook order.
 \description{
 List worksheet names
 }
+\examples{
+xlsx_sheets(system.file("extdata", "multisheet.xlsx", package = "rcxl"))
+}

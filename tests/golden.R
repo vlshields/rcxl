@@ -409,5 +409,149 @@ if (file.exists(m)) {
         "unknown name_repair errors")
 } else cat("note: mixed.xlsx fixture missing; skipping name_repair checks\n")
 
+## ---- 8. hardening: date precision, encoding, malformed input -------------
+# These build their own workbooks in tempdir() rather than using a fixture,
+# so they run under R CMD check on the tarball too, where the generated
+# fixtures are absent.
+
+if (nzchar(Sys.which(Sys.getenv("R_ZIPCMD", "zip")))) {
+  hd_DECL <- '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+  hd_NS <- paste0('xmlns="http://schemas.openxmlformats.org/spreadsheetml',
+                  '/2006/main" xmlns:r="http://schemas.openxmlformats.org',
+                  '/officeDocument/2006/relationships"')
+  hd_ct <- paste0(hd_DECL, '<Types xmlns="http://schemas.openxmlformats.org',
+    '/package/2006/content-types"><Default Extension="rels" ContentType="',
+    'application/vnd.openxmlformats-package.relationships+xml"/><Default ',
+    'Extension="xml" ContentType="application/xml"/><Override PartName="',
+    '/xl/workbook.xml" ContentType="application/vnd.openxmlformats-office',
+    'document.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/works',
+    'heets/sheet1.xml" ContentType="application/vnd.openxmlformats-office',
+    'document.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles',
+    '.xml" ContentType="application/vnd.openxmlformats-officedocument.spre',
+    'adsheetml.styles+xml"/></Types>')
+  hd_rels <- function(body)
+    paste0(hd_DECL, '<Relationships xmlns="http://schemas.openxmlformats.org',
+           '/package/2006/relationships">', body, '</Relationships>')
+  hd_parts <- function(sheet) list(
+    "[Content_Types].xml" = hd_ct,
+    "_rels/.rels" = hd_rels(paste0('<Relationship Id="rId1" Type="http://sch',
+      'emas.openxmlformats.org/officeDocument/2006/relationships/officeDocum',
+      'ent" Target="xl/workbook.xml"/>')),
+    "xl/workbook.xml" = paste0(hd_DECL, '<workbook ', hd_NS, '><sheets><sheet',
+      ' name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'),
+    "xl/_rels/workbook.xml.rels" = hd_rels(paste0(
+      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/offic',
+      'eDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml',
+      '"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/of',
+      'ficeDocument/2006/relationships/styles" Target="styles.xml"/>')),
+    # xf 1 is numFmtId 22, a builtin date-time format
+    "xl/styles.xml" = paste0(hd_DECL, '<styleSheet ', hd_NS, '><fonts count=',
+      '"1"><font/></fonts><fills count="1"><fill/></fills><borders count="1">',
+      '<border/></borders><cellStyleXfs count="1"><xf numFmtId="0"/></cellSty',
+      'leXfs><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="22" applyNumb',
+      'erFormat="1"/></cellXfs></styleSheet>'),
+    "xl/worksheets/sheet1.xml" = sheet)
+
+  # sheet may be a character scalar or a raw vector (for invalid-UTF-8 bytes)
+  hd_write <- function(name, sheet) {
+    td <- file.path(tempdir(), paste0("hd_", name))
+    unlink(td, recursive = TRUE)
+    dir.create(td, recursive = TRUE)
+    parts <- hd_parts(sheet)
+    for (nm in names(parts)) {
+      f <- file.path(td, nm)
+      dir.create(dirname(f), recursive = TRUE, showWarnings = FALSE)
+      con <- file(f, open = "wb")
+      v <- parts[[nm]]
+      writeBin(if (is.raw(v)) v else charToRaw(v), con)
+      close(con)
+    }
+    p <- file.path(tempdir(), paste0("hd_", name, ".xlsx"))
+    if (file.exists(p)) unlink(p)
+    old <- setwd(td)
+    on.exit(setwd(old), add = TRUE)
+    utils::zip(p, ".", flags = "-r9Xq")
+    p
+  }
+  hd_sheet <- function(body)
+    paste0(hd_DECL, '<worksheet ', hd_NS, '><sheetData>', body,
+           '</sheetData></worksheet>')
+  hd_hdr <- function(nm)
+    paste0('<row r="1"><c r="A1" t="inlineStr"><is><t>', nm,
+           '</t></is></c></row>')
+
+  # 8a. a whole second must survive as a whole second.  The day fraction has
+  # no exact binary form, so an unrounded conversion lands just under the
+  # second and formats one second early.
+  hd_want <- c("2020-01-01 12:34:56", "2021-07-04 23:59:59",
+               "1999-12-31 00:00:01", "2024-11-05 17:45:33",
+               "2007-03-14 08:09:10")
+  hd_t <- as.POSIXct(hd_want, tz = "UTC")
+  hd_ser <- 25569 + as.numeric(hd_t) / 86400
+  hd_r <- seq_along(hd_ser) + 1L
+  p <- hd_write("dates", hd_sheet(paste0(hd_hdr("when"), paste0(
+    '<row r="', hd_r, '"><c r="A', hd_r, '" s="1"><v>',
+    sprintf("%.15g", hd_ser), '</v></c></row>', collapse = ""))))
+  hd_got <- read_xlsx(p)$when
+  check(inherits(hd_got, "POSIXct"), "hardening: datetime column typed")
+  check(identical(format(hd_got, "%Y-%m-%d %H:%M:%S", tz = "UTC"), hd_want),
+        "hardening: whole seconds read back as whole seconds")
+
+  # 8b. text that is not valid UTF-8 must not reach R tagged as UTF-8:
+  # nchar()/substr() throw on such a string, so the repair happens here.
+  p <- hd_write("utf8", c(
+    charToRaw(paste0(hd_DECL, '<worksheet ', hd_NS, '><sheetData>',
+                     hd_hdr("txt"),
+                     '<row r="2"><c r="A2" t="inlineStr"><is><t>A')),
+    as.raw(c(0xff, 0xfe, 0x80)),
+    charToRaw('B</t></is></c></row></sheetData></worksheet>')))
+  hd_u <- read_xlsx(p)$txt
+  check(validUTF8(hd_u[1]), "hardening: invalid UTF-8 repaired on read")
+  check(!inherits(try(nchar(hd_u), silent = TRUE), "try-error"),
+        "hardening: nchar() works on repaired text")
+  check(!inherits(try(toupper(hd_u), silent = TRUE), "try-error"),
+        "hardening: toupper() works on repaired text")
+
+  # 8c. a malformed character reference must stay literal text, not decode
+  # to codepoint 0 and put a NUL in the middle of an R string
+  hd_lit <- "&notanentity; &#; &#xZZ; &#999999999; ok"
+  p <- hd_write("entity", hd_sheet(paste0(hd_hdr("txt"),
+    '<row r="2"><c r="A2" t="inlineStr"><is><t>', hd_lit,
+    '</t></is></c></row>')))
+  hd_e <- try(read_xlsx(p), silent = TRUE)
+  check(!inherits(hd_e, "try-error"),
+        "hardening: malformed character reference does not abort the read")
+  if (!inherits(hd_e, "try-error"))
+    check(identical(hd_e$txt[1], hd_lit),
+          "hardening: malformed character reference kept literal")
+
+  # 8d. a row number past the sheet limit sizes every column array from a
+  # bogus extent, so it must be rejected rather than allocated for
+  p <- hd_write("bigrow", hd_sheet(paste0(hd_hdr("x"),
+    '<row r="999999999999"><c r="A999999999999"><v>1</v></c></row>')))
+  hd_b <- try(read_xlsx(p), silent = TRUE)
+  check(inherits(hd_b, "try-error") && grepl("1048576", hd_b),
+        "hardening: row past the sheet limit errors instead of allocating")
+
+  # 8e. structurally broken containers must error, never crash
+  hd_src <- fx("edge")
+  if (file.exists(hd_src)) {
+    hd_raw <- readBin(hd_src, "raw", file.size(hd_src))
+    hd_bad <- list(empty = raw(0),
+                   notzip = charToRaw(strrep("not a zip ", 100)),
+                   truncated = hd_raw[seq_len(length(hd_raw) %/% 2)],
+                   header_only = hd_raw[1:4])
+    for (nm in names(hd_bad)) {
+      bp <- file.path(tempdir(), paste0("hd_broken_", nm, ".xlsx"))
+      writeBin(hd_bad[[nm]], bp)
+      check(inherits(try(read_xlsx(bp), silent = TRUE), "try-error"),
+            paste0("hardening: broken container '", nm, "' errors in read_xlsx"))
+      check(inherits(try(xlsx_sheets(bp), silent = TRUE), "try-error"),
+            paste0("hardening: broken container '", nm,
+                   "' errors in xlsx_sheets"))
+    }
+  }
+} else cat("note: no zip command available; skipping hardening checks\n")
+
 if (fails > 0L) stop(fails, " golden check(s) failed")
 cat("all golden checks passed\n")

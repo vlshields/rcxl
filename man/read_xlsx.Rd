@@ -77,6 +77,20 @@ that the 1900 system counts.
 Cells that cannot be coerced to a type forced through \code{col_types} become
 \code{NA}, with a warning giving the count and the first offending cell.
 }
+\examples{
+types <- system.file("extdata", "types.xlsx", package = "rcxl")
+str(read_xlsx(types))
+
+# read a rectangle rather than the whole sheet
+read_xlsx(types, range = "A1:C3")
+
+# force every column to character instead of guessing
+str(read_xlsx(types, col_types = "text"))
+
+# a sheet other than the first, by name or by position
+multi <- system.file("extdata", "multisheet.xlsx", package = "rcxl")
+read_xlsx(multi, sheet = "Beta")
+}
 \seealso{
 \code{\link[=read_xlsx_all]{read_xlsx_all()}} to read several sheets in one workbook pass;
 \code{\link[=xlsx_sheets]{xlsx_sheets()}} for the sheet names.

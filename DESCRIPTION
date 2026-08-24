@@ -1,13 +1,27 @@
 Package: rcxl
-Type: Package
-Title: Parse Excel Files
-Version: 0.0.0.9000
-Authors@R: person("Vincent", "Shields", email = "vince.shields913@gmail.com",
-    role = c("aut", "cre"))
+Title: Read 'xlsx' Files with a Native Parser
+Version: 0.1.0
+Authors@R: c(
+    person("Vincent", "Shields", email = "vince.shields913@gmail.com",
+           role = c("aut", "cre", "cph")),
+    person("Rich Geldreich", role = "cph",
+           comment = "author of the bundled miniz"),
+    person("Tenacious Software LLC", role = "cph",
+           comment = "copyright holder of the bundled miniz"),
+    person("RAD Game Tools and Valve Software", role = "cph",
+           comment = "copyright holder of the bundled miniz"),
+    person("Eric Biggers", role = "cph",
+           comment = "author of the bundled libdeflate"),
+    person("Google LLC", role = "cph",
+           comment = "copyright holder of the bundled libdeflate"))
 Description: Reads tabular data from 'xlsx' files with a specialized C parser.
     Worksheet XML is scanned in a single pass and decoded directly into R
-    vectors, with no intermediate document model.
+    vectors, with no intermediate document model. Bundles the 'miniz' and
+    'libdeflate' decompressors to read the underlying archive.
 License: MIT + file LICENSE
+Copyright: file inst/COPYRIGHTS
+URL: https://github.com/vlshields/rcxl
+BugReports: https://github.com/vlshields/rcxl/issues
 Encoding: UTF-8
 Depends: R (>= 4.0)
 Suggests: readxl, cellranger

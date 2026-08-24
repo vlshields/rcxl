@@ -63,3 +63,12 @@ Reads multiple sheets from an xlsx file through one shared workbook pass,
 so the ZIP directory, shared strings and styles are parsed once. All
 arguments other than \code{sheets} apply to every sheet read.
 }
+\examples{
+multi <- system.file("extdata", "multisheet.xlsx", package = "rcxl")
+sheets <- read_xlsx_all(multi)
+names(sheets)
+sheets[["Alpha"]]
+
+# a subset of the sheets, still in one workbook pass
+names(read_xlsx_all(multi, sheets = c("Alpha", "Gamma")))
+}
