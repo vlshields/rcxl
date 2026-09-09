@@ -10,13 +10,25 @@ MIT license, reproduced in full below.
 -------------------------------------------------------------------------
 src/miniz.c, src/miniz.h -- miniz 11.0.2 (https://github.com/richgel999/miniz)
 
-Only the ZIP reader is compiled: the build defines
-MINIZ_NO_ARCHIVE_WRITING_APIS, MINIZ_NO_ZLIB_COMPATIBLE_NAMES and
-MINIZ_DISABLE_ZIP_READER_CRC32_CHECKS (see src/Makevars).
+The ZIP writing API is compiled out: the build defines
+MINIZ_NO_ARCHIVE_WRITING_APIS and MINIZ_NO_ZLIB_COMPATIBLE_NAMES (see
+src/Makevars). The source files are otherwise unmodified upstream copies.
+
+miniz also carries these individually credited contributions, all reproduced
+as shipped upstream:
+
+  * The ZIP reader section (miniz.c, "miniz_zip") is additionally
+    Copyright 2016 Martin Raiber, under the same MIT license below.
+  * tdefl_write_image_to_png_file_in_memory_ex() is a modification of a PNG
+    writer by Alex Evans (2011), which he released into the public domain
+    (https://gist.github.com/908299).
+  * tdefl_calculate_minimum_redundancy() was originally written by Alistair
+    Moffat and Jyrki Katajainen (November 1996).
 -------------------------------------------------------------------------
 
 Copyright 2013-2014 RAD Game Tools and Valve Software
 Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
+Copyright 2016 Martin Raiber
 All Rights Reserved.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

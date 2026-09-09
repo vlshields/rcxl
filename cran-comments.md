@@ -1,3 +1,23 @@
+## Resubmission
+
+This is a resubmission. In response to the CRAN reviewer's comments:
+
+* Removed the single quotes around "xlsx" in the Title and Description, as
+  requested. The quotes around 'miniz' and 'libdeflate' (software names) are
+  kept.
+
+* Added every author, contributor and copyright holder of the bundled code to
+  Authors@R. The bundled miniz sources credit, besides Rich Geldreich,
+  Tenacious Software LLC and RAD Game Tools and Valve Software (already
+  listed), a 2016 copyright by Martin Raiber on the ZIP reader, a
+  public-domain PNG writer by Alex Evans, and a minimum-redundancy routine
+  by Alistair Moffat and Jyrki Katajainen. Martin Raiber is now listed with
+  roles "ctb" and "cph"; Alex Evans, Alistair Moffat and Jyrki Katajainen
+  with role "ctb". The library authors Rich Geldreich and Eric Biggers now
+  carry "ctb" in addition to "cph". inst/COPYRIGHTS (referenced from the
+  Copyright field) was updated to record the same contributions and their
+  licence terms, and to correct a stale note about a build flag.
+
 ## Test environments
 
 * local: Debian GNU/Linux 13 (trixie), R 4.5.0
