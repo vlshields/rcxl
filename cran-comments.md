@@ -1,22 +1,15 @@
-## Resubmission
+## Patch release 0.1.1
 
-This is a resubmission. In response to the CRAN reviewer's comments:
+This release fixes the installation failure of 0.1.0 reported on the CRAN
+check page for r-release-macos-x86_64, r-oldrel-macos-arm64 and
+r-oldrel-macos-x86_64. Those builders use the macOS 11 SDK, whose stdio.h
+declares a BSD `zopen()`; the package defined a static helper of the same
+name, which clang rejects as a redeclaration. The helper family has been
+renamed with a `zsrc_` prefix. r-release-macos-arm64 (macOS 14.5 SDK) and all
+Linux flavors were unaffected.
 
-* Removed the single quotes around "xlsx" in the Title and Description, as
-  requested. The quotes around 'miniz' and 'libdeflate' (software names) are
-  kept.
-
-* Added every author, contributor and copyright holder of the bundled code to
-  Authors@R. The bundled miniz sources credit, besides Rich Geldreich,
-  Tenacious Software LLC and RAD Game Tools and Valve Software (already
-  listed), a 2016 copyright by Martin Raiber on the ZIP reader, a
-  public-domain PNG writer by Alex Evans, and a minimum-redundancy routine
-  by Alistair Moffat and Jyrki Katajainen. Martin Raiber is now listed with
-  roles "ctb" and "cph"; Alex Evans, Alistair Moffat and Jyrki Katajainen
-  with role "ctb". The library authors Rich Geldreich and Eric Biggers now
-  carry "ctb" in addition to "cph". inst/COPYRIGHTS (referenced from the
-  Copyright field) was updated to record the same contributions and their
-  licence terms, and to correct a stale note about a build flag.
+Every function and macro defined in the package sources was checked against
+the macOS 11 SDK headers; `zopen` was the only collision.
 
 ## Test environments
 
@@ -36,13 +29,11 @@ was checked via GitHub Actions instead.
 * checking CRAN incoming feasibility ... NOTE
 Maintainer: 'Vincent Shields <vince.shields913@gmail.com>'
 
-New submission
+Days since last update: 1
 
 Possibly misspelled words in DESCRIPTION:
   decompressors (20:18)
 ```
-
-This is a new submission.
 
 "decompressors" is spelled correctly; it is the plural of "decompressor" and
 refers to the two bundled decompression libraries ('miniz' and 'libdeflate').

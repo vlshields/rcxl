@@ -460,7 +460,9 @@ typedef struct {
 static void *ld_malloc(size_t n) { return scratch_alloc(n); }
 static void ld_free(void *p) { (void)p; }
 
-static int zopen(zipsrc_t *z, const char *path)
+/* zsrc_ prefix: the macOS 11 SDK declares a BSD zopen() in <stdio.h>, and a
+   static function of the same name fails to compile there */
+static int zsrc_open(zipsrc_t *z, const char *path)
 {
     z->data = slurp_file(path, &z->n);
     if (!z->data) return 0;
@@ -472,14 +474,14 @@ static int zopen(zipsrc_t *z, const char *path)
     return 1;
 }
 
-static void zclose(zipsrc_t *z)
+static void zsrc_close(zipsrc_t *z)
 {
     mz_zip_reader_end(&z->za);
 }
 
 /* locate the part's payload in the whole-file buffer: the local header's own
    name/extra lengths can differ from the central directory's copy */
-static const char *zpayload(const zipsrc_t *z, const mz_zip_archive_file_stat *st)
+static const char *zsrc_payload(const zipsrc_t *z, const mz_zip_archive_file_stat *st)
 {
     mz_uint64 ofs = st->m_local_header_ofs;
     if (ofs + 30 > z->n) return NULL;
@@ -497,13 +499,13 @@ static const char *zpayload(const zipsrc_t *z, const mz_zip_archive_file_stat *s
    corrupt one as missing would drop shared strings or date styles. */
 enum { ZPART_CORRUPT = -1, ZPART_MISSING = 0, ZPART_OK = 1 };
 
-static int zread(zipsrc_t *z, const char *name, buf_t *out)
+static int zsrc_read(zipsrc_t *z, const char *name, buf_t *out)
 {
     int idx = mz_zip_reader_locate_file(&z->za, name, NULL, 0);
     if (idx < 0) return ZPART_MISSING;
     mz_zip_archive_file_stat st;
     if (!mz_zip_reader_file_stat(&z->za, (mz_uint)idx, &st)) return ZPART_CORRUPT;
-    const char *payload = zpayload(z, &st);
+    const char *payload = zsrc_payload(z, &st);
     if (!payload) return ZPART_CORRUPT;
     char *buf = scratch_alloc((size_t)st.m_uncomp_size + 1);
     if (st.m_method == 0) {
@@ -857,17 +859,17 @@ static void wb_open(wb_t *w, const char *cpath)
 {
     memset(w, 0, sizeof *w);
     scratch_reset();
-    if (!zopen(&w->za, cpath))
+    if (!zsrc_open(&w->za, cpath))
         error("cannot open '%s' as a zip archive", cpath);
-    int rc = zread(&w->za, "xl/workbook.xml", &w->wb);
+    int rc = zsrc_read(&w->za, "xl/workbook.xml", &w->wb);
     if (rc != ZPART_OK) {
-        zclose(&w->za);
+        zsrc_close(&w->za);
         if (rc == ZPART_CORRUPT)
             error("'%s' is corrupt: cannot extract xl/workbook.xml", cpath);
         error("'%s' has no xl/workbook.xml; not an xlsx file", cpath);
     }
-    if (zread(&w->za, "xl/_rels/workbook.xml.rels", &w->rels) == ZPART_CORRUPT) {
-        zclose(&w->za);
+    if (zsrc_read(&w->za, "xl/_rels/workbook.xml.rels", &w->rels) == ZPART_CORRUPT) {
+        zsrc_close(&w->za);
         error("'%s' is corrupt: cannot extract xl/_rels/workbook.xml.rels",
               cpath);
     }
@@ -877,9 +879,9 @@ static void wb_open(wb_t *w, const char *cpath)
 static void wb_meta(wb_t *w)
 {
     buf_t sstbuf = {NULL, 0}, sty = {NULL, 0};
-    if (zread(&w->za, "xl/sharedStrings.xml", &sstbuf) == ZPART_CORRUPT)
+    if (zsrc_read(&w->za, "xl/sharedStrings.xml", &sstbuf) == ZPART_CORRUPT)
         w->bad_part = "xl/sharedStrings.xml";
-    else if (zread(&w->za, "xl/styles.xml", &sty) == ZPART_CORRUPT)
+    else if (zsrc_read(&w->za, "xl/styles.xml", &sty) == ZPART_CORRUPT)
         w->bad_part = "xl/styles.xml";
     w->date1904 = wb_date1904(w->wb);
     parse_styles(sty, &w->xf_date, &w->n_xf);
@@ -1915,7 +1917,7 @@ static int sheet_extract_start(wb_t *w, const char *target, infjob_t *ij,
     int sidx = mz_zip_reader_locate_file(&w->za.za, target, NULL, 0);
     mz_zip_archive_file_stat st;
     if (sidx < 0 || !mz_zip_reader_file_stat(&w->za.za, (mz_uint)sidx, &st) ||
-        !(ij->comp = zpayload(&w->za, &st)) ||
+        !(ij->comp = zsrc_payload(&w->za, &st)) ||
         (st.m_method != 0 && st.m_method != 8))
         return 0;
     out->n = (size_t)st.m_uncomp_size;
@@ -2408,7 +2410,7 @@ static void naset_build(naset_t *na, SEXP naArg)
 static SEXP read_impl(const char *cpath, SEXP sheetsArg, SEXP namesArg,
                       int trim, SEXP ctypesArg, SEXP naArg, const win_t *win)
 {
-    /* validated before wb_open: an error() here must not skip zclose */
+    /* validated before wb_open: an error() here must not skip zsrc_close */
     if (TYPEOF(naArg) != STRSXP) error("'na' must be a character vector");
     if (TYPEOF(namesArg) != STRSXP &&
         (TYPEOF(namesArg) != LGLSXP || XLENGTH(namesArg) != 1))
@@ -2435,7 +2437,7 @@ static SEXP read_impl(const char *cpath, SEXP sheetsArg, SEXP namesArg,
         long idx = wb_sheet_lookup(w.wb, want_name, want_idx, rid, sizeof rid,
                                    &names[i]);
         if (idx < 0) {
-            zclose(&w.za);
+            zsrc_close(&w.za);
             if (want_name) error("sheet '%s' not found", want_name);
             error("sheet %ld not found", want_idx);
         }
@@ -2480,7 +2482,7 @@ static SEXP read_impl(const char *cpath, SEXP sheetsArg, SEXP namesArg,
         fail_crc = ij.crc_bad;
     } else if (spawned && fail)
         pthread_join(ith, NULL);
-    zclose(&w.za);
+    zsrc_close(&w.za);
     if (fail_crc)
         error("'%s' is corrupt: CRC mismatch in part '%s'", cpath, fail);
     if (fail) error("cannot extract worksheet part '%s'", fail);
@@ -2549,17 +2551,17 @@ SEXP C_sheet_names(SEXP path)
     const char *cpath = translateChar(STRING_ELT(path, 0));
     scratch_reset();
     zipsrc_t za;
-    if (!zopen(&za, cpath))
+    if (!zsrc_open(&za, cpath))
         error("cannot open '%s' as a zip archive", cpath);
     buf_t wb = {NULL, 0};
-    int rc = zread(&za, "xl/workbook.xml", &wb);
+    int rc = zsrc_read(&za, "xl/workbook.xml", &wb);
     if (rc != ZPART_OK) {
-        zclose(&za);
+        zsrc_close(&za);
         if (rc == ZPART_CORRUPT)
             error("'%s' is corrupt: cannot extract xl/workbook.xml", cpath);
         error("'%s' has no xl/workbook.xml; not an xlsx file", cpath);
     }
-    zclose(&za);
+    zsrc_close(&za);
 
     const char *end = wb.p + wb.n;
     long count = 0;

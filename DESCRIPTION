@@ -1,6 +1,6 @@
 Package: rcxl
 Title: Read xlsx Files with a Native Parser
-Version: 0.1.0
+Version: 0.1.1
 Authors@R: c(
     person("Vincent", "Shields", email = "vince.shields913@gmail.com",
            role = c("aut", "cre", "cph")),
