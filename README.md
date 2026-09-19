@@ -1,5 +1,6 @@
 # rcxl
 
+[![CRAN status](https://www.r-pkg.org/badges/version/rcxl)](https://CRAN.R-project.org/package=rcxl)
 [![R-CMD-check](https://github.com/vlshields/rcxl/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/vlshields/rcxl/actions/workflows/R-CMD-check.yaml)
 
 Read tabular data from `xlsx` files with a native C parser.
@@ -9,6 +10,14 @@ with no intermediate document model. The `miniz` and `libdeflate`
 decompressors are bundled, so the package has no R dependencies beyond base R.
 
 ## Installation
+
+From CRAN:
+
+```r
+install.packages("rcxl")
+```
+
+The development version from GitHub:
 
 ```r
 # install.packages("remotes")
