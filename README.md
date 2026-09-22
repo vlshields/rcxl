@@ -5,9 +5,10 @@
 
 Read tabular data from `xlsx` files with a native C parser.
 
-Worksheet XML is scanned in a single pass and decoded directly into R vectors,
-with no intermediate document model. The `miniz` and `libdeflate`
-decompressors are bundled, so the package has no R dependencies beyond base R.
+rcxl decodes each worksheet directly into R vectors as it is scanned, with no
+intermediate document model. This keeps memory use close to the size of the
+data itself. The `miniz` and `libdeflate` decompressors are bundled, so the
+package has no R dependencies beyond base R.
 
 ## Installation
 
