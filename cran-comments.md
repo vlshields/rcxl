@@ -15,28 +15,18 @@ the macOS 11 SDK headers; `zopen` was the only collision.
 
 * local: Debian GNU/Linux 13 (trixie), R 4.5.0
 * win-builder: Windows Server 2022 x64, R 4.6.1 (release)
+* mac-builder: macOS 26.6 arm64, R 4.6.1 (release), macOS 14.4 SDK
 * GitHub Actions: macOS (R release), Windows (R release), Ubuntu (R devel,
   release, and oldrel-1), all with --as-cran
 
-The mac-builder service was unavailable at the time of submission, so macOS
-was checked via GitHub Actions instead.
-
 ## R CMD check results
 
-0 errors | 0 warnings | 1 note
+0 errors | 0 warnings | 0 notes
 
-```
-* checking CRAN incoming feasibility ... NOTE
-Maintainer: 'Vincent Shields <vince.shields913@gmail.com>'
-
-Days since last update: 1
-
-Possibly misspelled words in DESCRIPTION:
-  decompressors (20:18)
-```
-
-"decompressors" is spelled correctly; it is the plural of "decompressor" and
-refers to the two bundled decompression libraries ('miniz' and 'libdeflate').
+The incoming feasibility check may report "decompressors" in DESCRIPTION as
+possibly misspelled. It is spelled correctly; it is the plural of
+"decompressor" and refers to the two bundled decompression libraries ('miniz'
+and 'libdeflate').
 
 ## Bundled source
 
