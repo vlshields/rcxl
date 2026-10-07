@@ -1,0 +1,13 @@
+url: https://vlshields.github.io/rcxl/
+
+template:
+  bootstrap: 5
+
+reference:
+  - title: Reading workbooks
+    contents:
+      - read_xlsx
+      - read_xlsx_all
+  - title: Inspecting workbooks
+    contents:
+      - xlsx_sheets

@@ -9,3 +9,4 @@ tools/lib/
 tools/bench_data/
 *.Rcheck/
 *.tar.gz
+docs/
