@@ -1,7 +1,14 @@
 # rcxl
 
+<!-- badges: start -->
 [![CRAN status](https://www.r-pkg.org/badges/version/rcxl)](https://CRAN.R-project.org/package=rcxl)
 [![R-CMD-check](https://github.com/vlshields/rcxl/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/vlshields/rcxl/actions/workflows/R-CMD-check.yaml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+<!-- badges: end -->
+
+| CRAN checks | Linux | macOS | Windows |
+|:--|:--:|:--:|:--:|
+| [results](https://cran.r-project.org/web/checks/check_results_rcxl.html) | [![Linux](https://badges.cranchecks.info/flavor/linux/rcxl.svg)](https://cran.r-project.org/web/checks/check_results_rcxl.html) | [![macOS](https://badges.cranchecks.info/flavor/macos/rcxl.svg)](https://cran.r-project.org/web/checks/check_results_rcxl.html) | [![Windows](https://badges.cranchecks.info/flavor/windows/rcxl.svg)](https://cran.r-project.org/web/checks/check_results_rcxl.html) |
 
 Read tabular data from `xlsx` files with a native C parser.
 
@@ -87,6 +94,47 @@ whitespace, and `name_repair` is one of `"unique"` (default), `"minimal"`, or
 
 Set the `RCXL_THREADS` environment variable to override the worker count.
 Sheets under 4MB are read serially regardless.
+
+## Coming from readxl
+
+rcxl has no `guess_max` or `progress` argument. The arguments `sheet`, `skip`, `n_max`, `na`, `trim_ws`, `col_names`,
+and `col_types` behave the way they do in readxl, and dates come back as
+`POSIXct` in UTC. `range` behaves more or less the same, with one
+edge case (see below). 
+
+| | readxl | rcxl |
+|---|---|---|
+| Return type | tibble | plain data.frame |
+| Listing sheets | `excel_sheets()` | `xlsx_sheets()` |
+| Reading every sheet | loop over the sheets | `read_xlsx_all()` |
+| Type guessing | first `guess_max` rows | every cell in the read area |
+| Name repair | `.name_repair`, any tidyverse option | `name_repair`: `"unique"`, `"minimal"`, or `"check_unique"` |
+| Formats | `xls` and `xlsx` | `xlsx` only |
+| `range` entirely past the data | 0-by-0 result | the range's rectangle, as all-`NA` columns |
+
+
+
+### Masking
+
+Both packages export `read_xlsx()`. If both are attached, the one attached
+last masks the other:
+
+```r
+library(readxl)
+library(rcxl)
+#> Attaching package: 'rcxl'
+#>
+#> The following object is masked from 'package:readxl':
+#>
+#>     read_xlsx
+```
+
+To be explicit about which one runs, call it with the namespace:
+
+```r
+rcxl::read_xlsx(path)
+readxl::read_xlsx(path)
+```
 
 ## License
 
