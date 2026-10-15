@@ -123,6 +123,52 @@
 <p>Set the <code>RCXL_THREADS</code> environment variable to override the worker count. Sheets under 4MB are read serially regardless.</p>
 </div>
 <div class="section level2">
+<h2 id="performance">Performance<a class="anchor" aria-label="anchor" href="#performance"></a>
+</h2>
+<p>Median wall-clock time to read each file, warm cache, measured with the <code>bench</code> package. rcxl and readxl outputs were verified identical cell for cell.</p>
+<table class="table">
+<thead><tr>
+<th>File</th>
+<th align="right">rcxl</th>
+<th align="right">rcxl, 1 thread</th>
+<th align="right">readxl</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>BTS on-time reporting, 96 MB</td>
+<td align="right">2.51 s</td>
+<td align="right">3.99 s</td>
+<td align="right">15.9 s</td>
+</tr>
+<tr>
+<td>numeric fixture, 16 MB</td>
+<td align="right">124 ms</td>
+<td align="right">215 ms</td>
+<td align="right">954 ms</td>
+</tr>
+<tr>
+<td>mixed fixture, 10 MB</td>
+<td align="right">136 ms</td>
+<td align="right">204 ms</td>
+<td align="right">796 ms</td>
+</tr>
+<tr>
+<td>shared-strings fixture</td>
+<td align="right">31 ms</td>
+<td align="right">49 ms</td>
+<td align="right">376 ms</td>
+</tr>
+<tr>
+<td>wide fixture</td>
+<td align="right">24 ms</td>
+<td align="right">45 ms</td>
+<td align="right">186 ms</td>
+</tr>
+</tbody>
+</table>
+<p>rcxl 0.1.1, readxl 1.5.0, R 4.5.0, bench 1.1.4, on an AMD Ryzen 3 7320U (8 cores) under Linux, 2026-10-15. Medians of 15 iterations (5 for the on-time file), repeated across three runs that agreed within 3%. The fixtures come from <code>tools/make_fixtures.R</code>; the on-time file is the public Bureau of Transportation Statistics on-time reporting table converted to xlsx. The script is <code>tools/bench_mark.R</code>.</p>
+</div>
+<div class="section level2">
 <h2 id="coming-from-readxl">Coming from readxl<a class="anchor" aria-label="anchor" href="#coming-from-readxl"></a>
 </h2>
 <p>rcxl has no <code>guess_max</code> or <code>progress</code> argument. The arguments <code>sheet</code>, <code>skip</code>, <code>n_max</code>, <code>na</code>, <code>trim_ws</code>, <code>col_names</code>, and <code>col_types</code> behave the way they do in readxl, and dates come back as <code>POSIXct</code> in UTC. <code>range</code> behaves more or less the same, with one edge case (see below).</p>
