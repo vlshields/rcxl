@@ -95,6 +95,26 @@ whitespace, and `name_repair` is one of `"unique"` (default), `"minimal"`, or
 Set the `RCXL_THREADS` environment variable to override the worker count.
 Sheets under 4MB are read serially regardless.
 
+## Performance
+
+Median wall-clock time to read each file, warm cache, measured with the
+`bench` package. rcxl and readxl outputs were verified identical cell for cell.
+
+| File | rcxl | rcxl, 1 thread | readxl |
+|---|---:|---:|---:|
+| BTS on-time reporting, 96 MB | 2.51 s | 3.99 s | 15.9 s |
+| numeric fixture, 16 MB | 124 ms | 215 ms | 954 ms |
+| mixed fixture, 10 MB | 136 ms | 204 ms | 796 ms |
+| shared-strings fixture | 31 ms | 49 ms | 376 ms |
+| wide fixture | 24 ms | 45 ms | 186 ms |
+
+rcxl 0.1.1, readxl 1.5.0, R 4.5.0, bench 1.1.4, on an AMD Ryzen 3 7320U
+(8 cores) under Linux, 2026-10-15. Medians of 15 iterations (5 for the
+on-time file), repeated across three runs that agreed within 3%. The fixtures
+come from `tools/make_fixtures.R`; the on-time file is the public Bureau of
+Transportation Statistics on-time reporting table converted to xlsx. The
+script is `tools/bench_mark.R`.
+
 ## Coming from readxl
 
 rcxl has no `guess_max` or `progress` argument. The arguments `sheet`, `skip`, `n_max`, `na`, `trim_ws`, `col_names`,
