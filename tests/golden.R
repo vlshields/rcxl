@@ -594,6 +594,40 @@ if (nzchar(Sys.which(Sys.getenv("R_ZIPCMD", "zip")))) {
   check(is.logical(hd_par$flag) &&
         sum(!is.na(hd_par$flag)) == hd_n %/% 3L,
         "hardening: threaded bools and blanks")
+
+  # 8g. a raw NUL in a cell makes R error while interning strings, with
+  # fill workers still writing numeric columns. Without a guaranteed join,
+  # workers outlive the unwind and corrupt the heap: the reads below then
+  # segfault in later, unrelated allocations. One worker usually escapes
+  # unharmed, so this only detects the bug where more than 2 threads are
+  # allowed, i.e. not under R CMD check's core limit.
+  hd_i <- 2:51
+  hd_cols <- LETTERS[1:8]
+  hd_num <- function(r) paste0('<c r="', hd_cols, r, '"><v>', r, '</v></c>',
+                               collapse = "")
+  p <- hd_write("nul", c(
+    charToRaw(paste0(hd_DECL, '<worksheet ', hd_NS, '><sheetData><row r="1">',
+      paste0('<c r="', c(hd_cols, "I"), '1" t="inlineStr"><is><t>',
+             c(hd_cols, "I"), '</t></is></c>', collapse = ""),
+      '</row><row r="2">', hd_num(2), '<c r="I2" t="inlineStr"><is><t>x')),
+    as.raw(0),
+    charToRaw(paste0('y</t></is></c></row>',
+      paste0('<row r="', hd_i + 1L, '">', vapply(hd_i + 1L, hd_num, ""),
+             '</row>', collapse = ""),
+      '</sheetData></worksheet>'))))
+  hd_thr <- Sys.getenv("RCXL_THREADS", unset = NA)
+  Sys.setenv(RCXL_THREADS = "8")
+  for (hd_k in 1:30) {
+    hd_e <- try(read_xlsx(p), silent = TRUE)
+    hd_junk <- lapply(1:50, function(k) runif(1e5))
+    invisible(gc())
+  }
+  if (is.na(hd_thr)) Sys.unsetenv("RCXL_THREADS") else
+    Sys.setenv(RCXL_THREADS = hd_thr)
+  check(inherits(hd_e, "try-error") && grepl("nul", hd_e),
+        "hardening: embedded NUL errors cleanly under threads")
+  check(all(vapply(hd_junk, function(v) all(v >= 0 & v <= 1), NA)),
+        "hardening: heap intact after threaded error unwind")
 } else cat("note: no zip command available; skipping hardening checks\n")
 
 ## ---- 9. foreign writer: LibreOffice Calc ---------------------------------

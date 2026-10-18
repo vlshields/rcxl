@@ -2045,6 +2045,55 @@ static void *fill_thread(void *arg)
     return NULL;
 }
 
+typedef struct {
+    pthread_t *th;
+    int n;
+} joinset_t;
+
+/* R_UnwindProtect cleanup, so workers are joined even when an error() or
+   interrupt unwinds past the main thread's share of the work: they write
+   into R vectors the unwind makes collectable, and read their spans off a
+   stack frame the unwind discards */
+static void join_workers(void *arg, Rboolean jump)
+{
+    (void)jump;
+    const joinset_t *js = (const joinset_t *)arg;
+    for (int i = 0; i < js->n; i++) pthread_join(js->th[i], NULL);
+}
+
+typedef struct {
+    SEXP ans, sst_table;
+    const grid_t *g;
+    int c0;
+    const int *src, *strcol;
+    int nstrcols;
+    R_xlen_t data0, r1;
+    long n_sst;
+    int trim;
+    const naset_t *na;
+} strfill_t;
+
+static SEXP intern_strcols(void *arg)
+{
+    const strfill_t *sf = (const strfill_t *)arg;
+    for (int si = 0; si < sf->nstrcols; si++) {
+        int oj = sf->strcol[si];
+        SEXP col = VECTOR_ELT(sf->ans, oj);
+        const col_t *c = &sf->g->cols[sf->c0 + sf->src[oj]];
+        for (R_xlen_t r = sf->data0; r < sf->r1; r++) {
+            /* SST is the hot case; indices were validated at parse time */
+            if (cell_tag(c, r) == CELL_SST)
+                SET_STRING_ELT(col, r - sf->data0,
+                               STRING_ELT(sf->sst_table, (R_xlen_t)c->num[r]));
+            else
+                SET_STRING_ELT(col, r - sf->data0,
+                               cell_charsxp(c, r, sf->sst_table, sf->n_sst,
+                                            sf->trim, sf->na));
+        }
+    }
+    return R_NilValue;
+}
+
 /* parse one extracted worksheet and materialize it as a named column list;
    sst_table/sst_interned accumulate interned shared strings across sheets */
 static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, SEXP namesArg,
@@ -2278,6 +2327,10 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, SEXP namesArg,
     /* array fills run on workers while the main thread interns strings */
     pthread_t fth[8];
     fillspan_t spans[8];
+    joinset_t js = {fth, 0};
+    strfill_t sf = {ans, sst_table, &g, c0, src, strcol, nstrcols, data0, r1,
+                    n_sst, trim, &w->na};
+    SEXP cont = PROTECT(R_MakeUnwindCont());
     int nworkers = 0;
     if (nth > 1 && njobs > 0 && n > 0) {
         int want = nth - 1;
@@ -2295,24 +2348,9 @@ static SEXP sheet_to_df(wb_t *w, buf_t sheet, const win_t *win, SEXP namesArg,
     } else {
         for (int i = 0; i < njobs; i++) fill_one(&jobs[i]);
     }
-
-    for (int si = 0; si < nstrcols; si++) {
-        int oj = strcol[si];
-        SEXP col = VECTOR_ELT(ans, oj);
-        col_t *c = &g.cols[c0 + src[oj]];
-        for (R_xlen_t r = data0; r < r1; r++) {
-            /* SST is the hot case; indices were validated at parse time */
-            if (cell_tag(c, r) == CELL_SST)
-                SET_STRING_ELT(col, r - data0,
-                               STRING_ELT(sst_table, (R_xlen_t)c->num[r]));
-            else
-                SET_STRING_ELT(col, r - data0,
-                               cell_charsxp(c, r, sst_table, n_sst, trim,
-                                            &w->na));
-        }
-    }
-
-    for (int i = 0; i < nworkers; i++) pthread_join(fth[i], NULL);
+    js.n = nworkers;
+    R_UnwindProtect(intern_strcols, &sf, join_workers, &js, cont);
+    UNPROTECT(1);
 
     SEXP dklass = PROTECT(allocVector(STRSXP, 2));
     SET_STRING_ELT(dklass, 0, mkChar("POSIXct"));
@@ -2404,6 +2442,53 @@ static void naset_build(naset_t *na, SEXP naArg)
     }
 }
 
+typedef struct {
+    wb_t *w;
+    const char *targets;
+    buf_t *sheets;
+    R_xlen_t nsel;
+    const char *fail;
+    int fail_crc;
+} metajob_t;
+
+static SEXP meta_and_rest(void *arg)
+{
+    metajob_t *mj = (metajob_t *)arg;
+    wb_meta(mj->w);
+    if (!mj->fail && mj->w->bad_part) {
+        mj->fail = mj->w->bad_part;
+        mj->fail_crc = 1;
+    }
+    for (R_xlen_t i = 1; !mj->fail && i < mj->nsel; i++) {
+        infjob_t ij2;
+        pthread_t th2;
+        int sp2;
+        if (!sheet_extract_start(mj->w, mj->targets + (size_t)i * 512, &ij2,
+                                 &mj->sheets[i], &th2, &sp2, 0) ||
+            !sheet_extract_finish(&ij2, &mj->sheets[i], &th2, sp2)) {
+            mj->fail = mj->targets + (size_t)i * 512;
+            mj->fail_crc = ij2.crc_bad;
+        }
+    }
+    return R_NilValue;
+}
+
+typedef struct {
+    wb_t *w;
+    pthread_t *th;
+    int spawned;
+} metaguard_t;
+
+/* the normal path joins in sheet_extract_finish; an unwind must join here,
+   or the worker keeps inflating into scratch the next call reuses */
+static void meta_unwind(void *arg, Rboolean jump)
+{
+    if (!jump) return;
+    const metaguard_t *mg = (const metaguard_t *)arg;
+    if (mg->spawned) pthread_join(*mg->th, NULL);
+    zsrc_close(&mg->w->za);
+}
+
 /* Shared driver: resolve the requested sheets (R_NilValue = every sheet, in
    workbook order), extract them while workbook metadata parses, then
    materialize each.  Returns a list named by actual sheet names. */
@@ -2447,35 +2532,22 @@ static SEXP read_impl(const char *cpath, SEXP sheetsArg, SEXP namesArg,
     }
 
     /* the first sheet inflates on a worker while metadata parses; the rest
-       extract inline afterwards.  (An allocation failure in that window
-       would longjmp past the join -- an accepted, OOM-only leak of the
-       worker's target buffer.) */
+       extract inline afterwards */
     buf_t *sheets =
         nsel ? (buf_t *)scratch_alloc((size_t)nsel * sizeof(buf_t)) : NULL;
+    SEXP cont = PROTECT(R_MakeUnwindCont());
     infjob_t ij;
     pthread_t ith;
     int spawned = 0;
-    const char *fail = NULL;
-    int fail_crc = 0;
+    metajob_t mj = {&w, targets, sheets, nsel, NULL, 0};
     if (nsel > 0 &&
         !sheet_extract_start(&w, targets, &ij, &sheets[0], &ith, &spawned, 1))
-        fail = targets;
-    wb_meta(&w);
-    if (!fail && w.bad_part) {
-        fail = w.bad_part;
-        fail_crc = 1;
-    }
-    for (R_xlen_t i = 1; !fail && i < nsel; i++) {
-        infjob_t ij2;
-        pthread_t th2;
-        int sp2;
-        if (!sheet_extract_start(&w, targets + (size_t)i * 512, &ij2,
-                                 &sheets[i], &th2, &sp2, 0) ||
-            !sheet_extract_finish(&ij2, &sheets[i], &th2, sp2)) {
-            fail = targets + (size_t)i * 512;
-            fail_crc = ij2.crc_bad;
-        }
-    }
+        mj.fail = targets;
+    metaguard_t mg = {&w, &ith, spawned};
+    R_UnwindProtect(meta_and_rest, &mj, meta_unwind, &mg, cont);
+    UNPROTECT(1);
+    const char *fail = mj.fail;
+    int fail_crc = mj.fail_crc;
     if (nsel > 0 && !fail &&
         !sheet_extract_finish(&ij, &sheets[0], &ith, spawned)) {
         fail = targets;
