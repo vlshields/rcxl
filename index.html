@@ -11,8 +11,8 @@
 <script src="deps/bootstrap-5.3.8/bootstrap.bundle.min.js"></script><link href="deps/font-awesome-6.5.2/css/all.min.css" rel="stylesheet">
 <link href="deps/font-awesome-6.5.2/css/v4-shims.min.css" rel="stylesheet">
 <script src="deps/headroom-0.11.0/headroom.min.js"></script><script src="deps/headroom-0.11.0/jQuery.headroom.min.js"></script><script src="deps/bootstrap-toc-1.0.1/bootstrap-toc.min.js"></script><script src="deps/clipboard.js-2.0.11/clipboard.min.js"></script><script src="deps/search-1.0.0/autocomplete.jquery.min.js"></script><script src="deps/search-1.0.0/fuse.min.js"></script><script src="deps/search-1.0.0/mark.min.js"></script><!-- pkgdown --><script src="pkgdown.js"></script><meta property="og:title" content="Read xlsx Files with a Native Parser">
-<meta name="description" content="Reads tabular data from xlsx files with a specialized C parser. Worksheet XML is scanned in a single pass and decoded directly into R vectors, with no intermediate document model. Bundles the miniz and libdeflate decompressors to read the underlying archive.">
-<meta property="og:description" content="Reads tabular data from xlsx files with a specialized C parser. Worksheet XML is scanned in a single pass and decoded directly into R vectors, with no intermediate document model. Bundles the miniz and libdeflate decompressors to read the underlying archive.">
+<meta name="description" content="Reads tabular data from xlsx files with a specialized C parser. Worksheet XML is scanned in a single pass into compact per-column buffers, with no intermediate document model, and the R vectors are built from those. Bundles the miniz and libdeflate decompressors to read the underlying archive.">
+<meta property="og:description" content="Reads tabular data from xlsx files with a specialized C parser. Worksheet XML is scanned in a single pass into compact per-column buffers, with no intermediate document model, and the R vectors are built from those. Bundles the miniz and libdeflate decompressors to read the underlying archive.">
 </head>
 <body>
     <a href="#main" class="visually-hidden-focusable">Skip to contents</a>
@@ -22,7 +22,7 @@
 
     <a class="navbar-brand me-2" href="index.html">rcxl</a>
 
-    <small class="nav-text text-muted me-auto" data-bs-toggle="tooltip" data-bs-placement="bottom" title="">0.1.1</small>
+    <small class="nav-text text-muted me-auto" data-bs-toggle="tooltip" data-bs-placement="bottom" title="">0.1.2</small>
 
 
     <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbar" aria-controls="navbar" aria-expanded="false" aria-label="Toggle navigation">
@@ -72,7 +72,7 @@
 </tr></tbody>
 </table>
 <p>Read tabular data from <code>xlsx</code> files with a native C parser.</p>
-<p>rcxl decodes each worksheet directly into R vectors as it is scanned, with no intermediate document model. This keeps memory use close to the size of the data itself. The <code>miniz</code> and <code>libdeflate</code> decompressors are bundled, so the package has no R dependencies beyond base R.</p>
+<p>rcxl scans worksheet XML in a single pass, with no intermediate document model: cells land in compact per-column buffers, and the R vectors are built from those once the sheet’s extent and column types are known. The <code>miniz</code> and <code>libdeflate</code> decompressors are bundled, so the package has no R dependencies beyond base R.</p>
 <div class="section level2">
 <h2 id="installation">Installation<a class="anchor" aria-label="anchor" href="#installation"></a>
 </h2>
@@ -120,12 +120,12 @@
 <span><span class="fu"><a href="reference/read_xlsx.html">read_xlsx</a></span><span class="op">(</span><span class="va">path</span>, col_types <span class="op">=</span> <span class="st">"text"</span><span class="op">)</span>                    <span class="co"># everything as character</span></span>
 <span><span class="fu"><a href="reference/read_xlsx.html">read_xlsx</a></span><span class="op">(</span><span class="va">path</span>, col_types <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/c.html" class="external-link">c</a></span><span class="op">(</span><span class="st">"skip"</span>, <span class="fu"><a href="https://rdrr.io/r/base/rep.html" class="external-link">rep</a></span><span class="op">(</span><span class="st">"guess"</span>, <span class="fl">9</span><span class="op">)</span><span class="op">)</span><span class="op">)</span>  <span class="co"># drop the first column</span></span></code></pre></div>
 <p>Other arguments: <code>na</code> blanks matching cells, <code>trim_ws</code> trims surrounding whitespace, and <code>name_repair</code> is one of <code>"unique"</code> (default), <code>"minimal"</code>, or <code>"check_unique"</code>. See <code><a href="reference/read_xlsx.html">?read_xlsx</a></code> for details.</p>
-<p>Set the <code>RCXL_THREADS</code> environment variable to override the worker count. Sheets under 4MB are read serially regardless.</p>
+<p>By default, worksheets with less than 4 MB of uncompressed XML are read serially and larger ones on several threads. Set the <code>RCXL_THREADS</code> environment variable to an explicit worker count; it overrides both the default count and the size threshold.</p>
 </div>
 <div class="section level2">
 <h2 id="performance">Performance<a class="anchor" aria-label="anchor" href="#performance"></a>
 </h2>
-<p>Median wall-clock time to read each file, warm cache, measured with the <code>bench</code> package. rcxl and readxl outputs were verified identical cell for cell.</p>
+<p>Median wall-clock time to read each file, warm cache, measured with the <code>bench</code> package. The timing runs do not compare outputs. Parity with readxl is checked separately: <code>tools/parity_big.R</code> requires an exact match, cell for cell, on the on-time file and the other large workbook, and the test suite compares the fixtures with a tolerance of 1e-9 on numeric values.</p>
 <table class="table">
 <thead><tr>
 <th>File</th>
@@ -166,12 +166,12 @@
 </tr>
 </tbody>
 </table>
-<p>rcxl 0.1.1, readxl 1.5.0, R 4.5.0, bench 1.1.4, on an AMD Ryzen 3 7320U (8 cores) under Linux, 2026-10-15. Medians of 15 iterations (5 for the on-time file), repeated across three runs that agreed within 3%. The fixtures come from <code>tools/make_fixtures.R</code>; the on-time file is the public Bureau of Transportation Statistics on-time reporting table converted to xlsx. The script is <code>tools/bench_mark.R</code>.</p>
+<p>rcxl 0.1.1, readxl 1.5.0, R 4.5.0, bench 1.1.4, on an AMD Ryzen 3 7320U (8 cores) under Linux, 2026-10-15. Medians of 15 iterations (5 for the on-time file). Across three runs the rcxl medians agreed within 3% and the readxl medians within 8%, the widest spread being readxl on the on-time file (15.6 s to 16.7 s). The raw results are in <code>tools/bench_results</code>. The fixtures come from <code>tools/make_fixtures.R</code>; the on-time file is the public Bureau of Transportation Statistics on-time reporting table converted to xlsx. The script is <code>tools/bench_mark.R</code>.</p>
 </div>
 <div class="section level2">
 <h2 id="coming-from-readxl">Coming from readxl<a class="anchor" aria-label="anchor" href="#coming-from-readxl"></a>
 </h2>
-<p>rcxl has no <code>guess_max</code> or <code>progress</code> argument. The arguments <code>sheet</code>, <code>skip</code>, <code>n_max</code>, <code>na</code>, <code>trim_ws</code>, <code>col_names</code>, and <code>col_types</code> behave the way they do in readxl, and dates come back as <code>POSIXct</code> in UTC. <code>range</code> behaves more or less the same, with one edge case (see below).</p>
+<p>rcxl has no <code>guess_max</code> or <code>progress</code> argument. The arguments <code>sheet</code>, <code>skip</code>, <code>n_max</code>, <code>trim_ws</code>, <code>col_names</code>, and <code>col_types</code> take the same values as in readxl, and the test suite checks <code>skip</code>, <code>n_max</code>, <code>range</code>, <code>col_names</code>, and <code>col_types</code> (including forced conversions) against readxl 1.5.0 on the shipped fixtures. Dates come back as <code>POSIXct</code> in UTC. <code>na</code> and <code>range</code> each differ in one case, and <code>name_repair</code> offers fewer options (see below).</p>
 <table class="table">
 <colgroup>
 <col width="33%">
@@ -225,6 +225,12 @@
 <code>range</code> entirely past the data</td>
 <td>0-by-0 result</td>
 <td>the range’s rectangle, as all-<code>NA</code> columns</td>
+</tr>
+<tr>
+<td>
+<code>na</code> against a numeric cell</td>
+<td>matches the text stored in the file</td>
+<td>matches the value, so <code>"-999.0"</code> blanks a cell holding -999</td>
 </tr>
 </tbody>
 </table>

@@ -37,12 +37,12 @@ Source:
 [`DESCRIPTION`](https://github.com/vlshields/rcxl/blob/dev/DESCRIPTION)
 
 Shields V (2026). *rcxl: Read xlsx Files with a Native Parser*. R
-package version 0.1.1, <https://github.com/vlshields/rcxl>.
+package version 0.1.2, <https://github.com/vlshields/rcxl>.
 
     @Manual{,
       title = {rcxl: Read xlsx Files with a Native Parser},
       author = {Vincent Shields},
       year = {2026},
-      note = {R package version 0.1.1},
+      note = {R package version 0.1.2},
       url = {https://github.com/vlshields/rcxl},
     }
