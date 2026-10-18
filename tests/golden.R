@@ -235,8 +235,8 @@ if (file.exists(ty)) {
   check(all(vapply(nm, is.numeric, TRUE)), "col_types numeric: all num")
   check(identical(nm$id, c(7, 42, 12345, NA)), "text-to-numeric coercion")
   check(identical(nm$flag, c(1, 0, NA, 1)), "bool-to-numeric coercion")
-  # divergence from readxl (which yields NA): dates become their serial,
-  # matching what guessing already does for mixed numeric/date columns
+  # dates become their serial, matching what guessing already does for mixed
+  # numeric/date columns; readxl 1.5.0 does the same
   check(identical(nm$stamp, c(44197, 44562.5, 30, NA)),
         "date-to-numeric gives the serial")
   check(identical(nm$mix, c(10, NA, 1, 61)), "mixed-to-numeric")

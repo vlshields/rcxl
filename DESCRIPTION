@@ -23,9 +23,10 @@ Authors@R: c(
     person("Google LLC", role = "cph",
            comment = "copyright holder of the bundled libdeflate"))
 Description: Reads tabular data from xlsx files with a specialized C parser.
-    Worksheet XML is scanned in a single pass and decoded directly into R
-    vectors, with no intermediate document model. Bundles the 'miniz' and
-    'libdeflate' decompressors to read the underlying archive.
+    Worksheet XML is scanned in a single pass into compact per-column
+    buffers, with no intermediate document model, and the R vectors are
+    built from those. Bundles the 'miniz' and 'libdeflate' decompressors to
+    read the underlying archive.
 License: MIT + file LICENSE
 Copyright: file inst/COPYRIGHTS
 URL: https://github.com/vlshields/rcxl

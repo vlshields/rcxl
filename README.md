@@ -12,10 +12,11 @@
 
 Read tabular data from `xlsx` files with a native C parser.
 
-rcxl decodes each worksheet directly into R vectors as it is scanned, with no
-intermediate document model. This keeps memory use close to the size of the
-data itself. The `miniz` and `libdeflate` decompressors are bundled, so the
-package has no R dependencies beyond base R.
+rcxl scans worksheet XML in a single pass, with no intermediate document
+model: cells land in compact per-column buffers, and the R vectors are built
+from those once the sheet's extent and column types are known. The `miniz`
+and `libdeflate` decompressors are bundled, so the package has no R
+dependencies beyond base R.
 
 ## Installation
 
@@ -92,13 +93,18 @@ Other arguments: `na` blanks matching cells, `trim_ws` trims surrounding
 whitespace, and `name_repair` is one of `"unique"` (default), `"minimal"`, or
 `"check_unique"`. See `?read_xlsx` for details.
 
-Set the `RCXL_THREADS` environment variable to override the worker count.
-Sheets under 4MB are read serially regardless.
+By default, worksheets with less than 4 MB of uncompressed XML are read
+serially and larger ones on several threads. Set the `RCXL_THREADS`
+environment variable to an explicit worker count; it overrides both the
+default count and the size threshold.
 
 ## Performance
 
 Median wall-clock time to read each file, warm cache, measured with the
-`bench` package. rcxl and readxl outputs were verified identical cell for cell.
+`bench` package. The timing runs do not compare outputs. Parity with readxl is
+checked separately: `tools/parity_big.R` requires an exact match, cell for
+cell, on the on-time file and the other large workbook, and the test suite
+compares the fixtures with a tolerance of 1e-9 on numeric values.
 
 | File | rcxl | rcxl, 1 thread | readxl |
 |---|---:|---:|---:|
@@ -110,17 +116,21 @@ Median wall-clock time to read each file, warm cache, measured with the
 
 rcxl 0.1.1, readxl 1.5.0, R 4.5.0, bench 1.1.4, on an AMD Ryzen 3 7320U
 (8 cores) under Linux, 2026-10-15. Medians of 15 iterations (5 for the
-on-time file), repeated across three runs that agreed within 3%. The fixtures
+on-time file). Across three runs the rcxl medians agreed within 3% and the
+readxl medians within 8%, the widest spread being readxl on the on-time file
+(15.6 s to 16.7 s). The raw results are in `tools/bench_results`. The fixtures
 come from `tools/make_fixtures.R`; the on-time file is the public Bureau of
 Transportation Statistics on-time reporting table converted to xlsx. The
 script is `tools/bench_mark.R`.
 
 ## Coming from readxl
 
-rcxl has no `guess_max` or `progress` argument. The arguments `sheet`, `skip`, `n_max`, `na`, `trim_ws`, `col_names`,
-and `col_types` behave the way they do in readxl, and dates come back as
-`POSIXct` in UTC. `range` behaves more or less the same, with one
-edge case (see below). 
+rcxl has no `guess_max` or `progress` argument. The arguments `sheet`,
+`skip`, `n_max`, `trim_ws`, `col_names`, and `col_types` take the same values
+as in readxl, and the test suite checks `skip`, `n_max`, `range`, `col_names`,
+and `col_types` (including forced conversions) against readxl 1.5.0 on the
+shipped fixtures. Dates come back as `POSIXct` in UTC. `na` and `range` each differ in one case, and
+`name_repair` offers fewer options (see below).
 
 | | readxl | rcxl |
 |---|---|---|
@@ -131,6 +141,7 @@ edge case (see below).
 | Name repair | `.name_repair`, any tidyverse option | `name_repair`: `"unique"`, `"minimal"`, or `"check_unique"` |
 | Formats | `xls` and `xlsx` | `xlsx` only |
 | `range` entirely past the data | 0-by-0 result | the range's rectangle, as all-`NA` columns |
+| `na` against a numeric cell | matches the text stored in the file | matches the value, so `"-999.0"` blanks a cell holding -999 |
 
 
 

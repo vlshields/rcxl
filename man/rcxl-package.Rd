@@ -4,16 +4,18 @@
 \name{rcxl-package}
 \alias{rcxl}
 \alias{rcxl-package}
-\title{rcxl: Read 'xlsx' Files with a Native Parser}
+\title{rcxl: Read xlsx Files with a Native Parser}
 \description{
-Reads tabular data from 'xlsx' files with a specialized C parser. Worksheet XML is scanned in a single pass and decoded directly into R vectors, with no intermediate document model. Bundles the 'miniz' and 'libdeflate' decompressors to read the underlying archive.
+Reads tabular data from xlsx files with a specialized C parser. Worksheet XML is scanned in a single pass into compact per-column buffers, with no intermediate document model, and the R vectors are built from those. Bundles the 'miniz' and 'libdeflate' decompressors to read the underlying archive.
 }
 \details{
-Worksheets of at least 4 MB are parsed on several threads; smaller ones are
-read serially. The worker count defaults to the number of available cores,
-capped at 8. Set the \code{RCXL_THREADS} environment variable to an explicit
-count to override that. When \verb{_R_CHECK_LIMIT_CORES_} is set, as it is under
-\verb{R CMD check}, no more than two workers are used whatever the setting.
+By default, worksheets with at least 4 MB of uncompressed XML are parsed on
+several threads and smaller ones are read serially. The worker count
+defaults to the number of available cores, capped at 8. Set the
+\code{RCXL_THREADS} environment variable to an explicit count to override both
+the count and the size threshold. When \verb{_R_CHECK_LIMIT_CORES_} is set, as it
+is under \verb{R CMD check}, no more than two workers are used whatever the
+setting.
 }
 \seealso{
 Useful links:
@@ -33,10 +35,14 @@ Authors:
 
 Other contributors:
 \itemize{
-  \item Rich Geldreich (author of the bundled miniz) [copyright holder]
+  \item Rich Geldreich (author of the bundled miniz) [contributor, copyright holder]
   \item Tenacious Software LLC (copyright holder of the bundled miniz) [copyright holder]
   \item RAD Game Tools and Valve Software (copyright holder of the bundled miniz) [copyright holder]
-  \item Eric Biggers (author of the bundled libdeflate) [copyright holder]
+  \item Martin Raiber (contributor to and copyright holder of the miniz ZIP reader) [contributor, copyright holder]
+  \item Alex Evans (author of the PNG writer in the bundled miniz) [contributor]
+  \item Alistair Moffat (author of the minimum-redundancy code in the bundled miniz) [contributor]
+  \item Jyrki Katajainen (author of the minimum-redundancy code in the bundled miniz) [contributor]
+  \item Eric Biggers (author of the bundled libdeflate) [contributor, copyright holder]
   \item Google LLC (copyright holder of the bundled libdeflate) [copyright holder]
 }
 
