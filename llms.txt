@@ -6,11 +6,10 @@
 
 Read tabular data from `xlsx` files with a native C parser.
 
-rcxl scans worksheet XML in a single pass, with no intermediate document
-model: cells land in compact per-column buffers, and the R vectors are
-built from those once the sheet’s extent and column types are known. The
-`miniz` and `libdeflate` decompressors are bundled, so the package has
-no R dependencies beyond base R.
+rcxl scans worksheet XML without building an XML document tree, using
+intermediate column buffers before constructing R vectors. The `miniz`
+and `libdeflate` decompressors are bundled, so the package has no R
+dependencies beyond base R.
 
 ## Installation
 

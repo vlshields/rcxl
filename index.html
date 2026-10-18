@@ -72,7 +72,7 @@
 </tr></tbody>
 </table>
 <p>Read tabular data from <code>xlsx</code> files with a native C parser.</p>
-<p>rcxl scans worksheet XML in a single pass, with no intermediate document model: cells land in compact per-column buffers, and the R vectors are built from those once the sheet’s extent and column types are known. The <code>miniz</code> and <code>libdeflate</code> decompressors are bundled, so the package has no R dependencies beyond base R.</p>
+<p>rcxl scans worksheet XML without building an XML document tree, using intermediate column buffers before constructing R vectors. The <code>miniz</code> and <code>libdeflate</code> decompressors are bundled, so the package has no R dependencies beyond base R.</p>
 <div class="section level2">
 <h2 id="installation">Installation<a class="anchor" aria-label="anchor" href="#installation"></a>
 </h2>
