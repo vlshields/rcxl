@@ -347,6 +347,13 @@ if (file.exists(naf)) {
         "entity-laden value matches decoded na")
   check(identical(d2$emp, c("", "", "z", NA)),
         "na without \"\" keeps empty strings")
+  check(identical(d2$esc, c(1, NA, 3, 4)),
+        "escaped na marker leaves numeric column numeric")
+  check(identical(d2$rich, c(1, NA, 3, 4)),
+        "rich-text na marker leaves numeric column numeric")
+  check(identical(d0$esc, c("1", "N&A", "3", "4")) &&
+          identical(d0$rich, c("1", "N&A", "3", "4")),
+        "escaped text is text when it is not an na marker")
 
   check(identical(read_xlsx(naf, na = "1e3")$num, c(1, -999, 3, NA)),
         "numeric na matches by value, not text")
@@ -356,7 +363,7 @@ if (file.exists(naf)) {
           identical(is.na(d4$dt), c(FALSE, TRUE, FALSE, FALSE)),
         "date cell na by serial value")
 
-  ct <- rep("guess", 7); ct[4] <- "numeric"
+  ct <- rep("guess", 9); ct[4] <- "numeric"
   r <- warns2(read_xlsx(naf, na = "N&A", col_types = ct))
   check(all(is.na(r$val$raw)) && length(r$w) == 1 &&
           grepl("3 cells in column 'raw'", r$w),
@@ -377,6 +384,10 @@ if (file.exists(naf)) {
     check(identical(got$txt, ref$txt), "readxl parity: na string col")
     check(identical(is.na(got$mix), is.na(ref$mix)),
           "readxl parity: na mixed col NA pattern")
+    ref2 <- as.data.frame(suppressWarnings(suppressMessages(
+      readxl::read_excel(naf, na = "N&A", progress = FALSE))))
+    check(identical(d2$esc, ref2$esc) && identical(d2$rich, ref2$rich),
+          "readxl parity: escaped na marker in numeric cols")
   }
 
   check(inherits(try(read_xlsx(naf, na = NA), silent = TRUE), "try-error"),
@@ -628,6 +639,42 @@ if (nzchar(Sys.which(Sys.getenv("R_ZIPCMD", "zip")))) {
         "hardening: embedded NUL errors cleanly under threads")
   check(all(vapply(hd_junk, function(v) all(v >= 0 & v <= 1), NA)),
         "hardening: heap intact after threaded error unwind")
+
+  # 8h. an na marker stored XML-escaped, or split across rich-text runs of
+  # an inline string, must be matched before the column is typed, on
+  # workers as well as serially; otherwise the column comes back as text
+  # with the marker spelled out instead of numeric with an NA
+  hd_str <- function(ref, v) paste0('<c r="', ref, '" t="str"><v>', v,
+                                    '</v></c>')
+  hd_one <- function(r, v) paste0('<c r="', c("A", "B", "C"), r, '"><v>', v,
+                                  '</v></c>', collapse = "")
+  p <- hd_write("escna", hd_sheet(paste0(
+    '<row r="1">',
+    '<c r="A1" t="inlineStr"><is><t>esc</t></is></c>',
+    '<c r="B1" t="inlineStr"><is><t>plain</t></is></c>',
+    '<c r="C1" t="inlineStr"><is><t>rich</t></is></c></row>',
+    '<row r="2">', hd_one(2, 1), '</row>',
+    '<row r="3">', hd_str("A3", "N&amp;A"), hd_str("B3", "N/A"),
+    '<c r="C3" t="inlineStr"><is><r><t>N&amp;</t></r><r><t>A</t></r></is>',
+    '</c></row>',
+    '<row r="4">', hd_one(4, 3), '</row>')))
+  hd_thr <- Sys.getenv("RCXL_THREADS", unset = NA)
+  Sys.setenv(RCXL_THREADS = "1")
+  hd_s <- read_xlsx(p, na = c("N&A", "N/A"))
+  Sys.setenv(RCXL_THREADS = "2")
+  hd_m <- read_xlsx(p, na = c("N&A", "N/A"))
+  if (is.na(hd_thr)) Sys.unsetenv("RCXL_THREADS") else
+    Sys.setenv(RCXL_THREADS = hd_thr)
+  hd_want <- c(1, NA, 3)
+  check(identical(hd_s$esc, hd_want) && identical(hd_s$rich, hd_want) &&
+          identical(hd_s$plain, hd_want),
+        "hardening: escaped na marker leaves numeric column numeric")
+  check(identical(hd_s, hd_m),
+        "hardening: escaped na marker matched on worker threads")
+  hd_d <- read_xlsx(p)
+  check(identical(hd_d$esc, c("1", "N&A", "3")) &&
+          identical(hd_d$rich, c("1", "N&A", "3")),
+        "hardening: escaped text stays text when no na marker names it")
 } else cat("note: no zip command available; skipping hardening checks\n")
 
 ## ---- 9. foreign writer: LibreOffice Calc ---------------------------------

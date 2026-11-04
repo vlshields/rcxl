@@ -40,5 +40,6 @@ jobs:
         uses: JamesIves/github-pages-deploy-action@v4.5.0
         with:
           clean: false
+          commit-message: Build site from ${{ github.sha }}
           branch: gh-pages
           folder: docs

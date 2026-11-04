@@ -1064,7 +1064,8 @@ typedef struct {
    mode) parse_rows never calls into R: tallies go to chunk-private arrays,
    string cells store zero-copy slices, and anything that would need
    allocation (entity decoding, multi-run inline strings) is deferred to
-   materialization on the main thread. */
+   materialization on the main thread; the one exception is the bounded
+   stack decode that probes such cells against the na set. */
 
 #define CNT_NUM 0
 #define CNT_DATE 1
@@ -1100,17 +1101,51 @@ static void chunk_extent(chunk_t *ck, int col, R_xlen_t row)
     if (row > ck->rmax) ck->rmax = row;
 }
 
+/* Decode a RAW slice into a caller-supplied buffer of RAW_NA_BUF bytes so
+   the na set can be matched at parse time.  Workers cannot allocate, and
+   decoded text is never longer than its escaped form, so a slice that fits
+   the buffer decodes whole.  Returns 0 for a longer slice, which is left
+   for materialization. */
+#define RAW_NA_BUF 4096
+static int decode_raw_bounded(str_t raw, unsigned char tag, char *buf,
+                              str_t *out)
+{
+    if (raw.n > RAW_NA_BUF) return 0;
+    int used = 0;
+    if (tag == CELL_STR_RAW)
+        used = unescape_into(raw.p, raw.n, buf);
+    else {
+        const char *end = raw.p + raw.n, *cur = raw.p;
+        str_t run;
+        while ((cur = next_text_run(cur, end, &run)) != NULL)
+            used += unescape_into(run.p, run.n, buf + used);
+    }
+    out->p = buf;
+    out->n = used;
+    return 1;
+}
+
 /* store a string cell: CELL_STR holds a ready slice; the RAW tags hold
    slices decoded at materialization time.  Text matching the na set
    (empty/whitespace-only by default) reads as NA without influencing typing
-   (readxl semantics), but still counts toward the sheet extent.  RAW slices
-   cannot be matched here -- they are na-checked after decoding at
-   materialization instead. */
+   (readxl semantics), but still counts toward the sheet extent.  A RAW
+   slice is probed through a bounded stack decode so an escaped marker is
+   matched here too; otherwise it would be tallied as a string and turn a
+   numeric column into text before materialization ever saw it. */
 static void chunk_set_str(chunk_t *ck, col_t *c, int col, R_xlen_t row,
                           str_t s, unsigned char tag)
 {
     chunk_extent(ck, col, row);
-    if (tag == CELL_STR && na_match(ck->na, str_trim(s))) {
+    int hit = 0;
+    if (tag == CELL_STR)
+        hit = na_match(ck->na, str_trim(s));
+    else if (ck->na->n || ck->na->has_empty) {
+        char buf[RAW_NA_BUF];
+        str_t dec;
+        hit = decode_raw_bounded(s, tag, buf, &dec) &&
+              na_match(ck->na, str_trim(dec));
+    }
+    if (hit) {
         c->tag[row] = CELL_EMPTY;
         return;
     }
@@ -1808,8 +1843,9 @@ static void force_col_main(const wb_t *w, SEXP col, const col_t *c, int t,
             if (tg == CELL_NUM || tg == CELL_DATE || tg == CELL_BOOL)
                 dp[i] = c->num[r];
             else if (cell_str_slice(w, c, r, tg, &s)) {
-                /* na-matched RAW cells reach here undecoded; they are NA,
-                   not coercion failures */
+                /* a RAW cell too long for the parse-time na probe reaches
+                   here undecoded; if it matches it is NA, not a coercion
+                   failure */
                 double d;
                 s = str_trim(s);
                 if (na_match(&w->na, s))

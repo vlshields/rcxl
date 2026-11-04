@@ -5,6 +5,12 @@
   running and writing into freed memory, which could crash the session or
   corrupt data. A raw NUL byte in a cell was enough to trigger it.
 
+* An `na` marker stored XML-escaped in the sheet, such as `N&amp;A` for
+  `"N&A"`, or split across the rich-text runs of an inline string, is now
+  matched before the column type is guessed. Previously such a cell counted
+  as text, so a numeric column holding it came back as character instead of
+  numeric with an NA.
+
 * Documentation corrections. `RCXL_THREADS` overrides the 4 MB serial
   threshold rather than being bound by it, the architecture description no
   longer claims cells are decoded straight into R vectors, and the readxl

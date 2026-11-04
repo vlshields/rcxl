@@ -330,12 +330,14 @@ gen("types.xlsx", {
 ## ---- na.xlsx: user-supplied NA strings -----------------------------------
 # columns: num (numeric incl. -999 and 1e3 sentinels), txt (sst/str strings,
 # one whitespace-padded), mix (num/sst/bool), raw (entity-laden t="str"),
-# emp (empty-string cells), gone (all "N/A"), dt (date serials)
+# emp (empty-string cells), gone (all "N/A"), dt (date serials),
+# esc (numeric with one XML-escaped "N&A" marker), rich (numeric with the
+# same marker split across rich-text runs of an inline string)
 gen("na.xlsx", {
   uniq <- c("N/A", "-999", "ok", "", "n/a",
-            "num", "txt", "mix", "raw", "emp", "gone", "dt")
+            "num", "txt", "mix", "raw", "emp", "gone", "dt", "esc", "rich")
   hdr <- paste0('<row r="1">',
-                paste0('<c r="', col_letter(1:7), '1" t="s"><v>', 5:11, '</v></c>',
+                paste0('<c r="', col_letter(1:9), '1" t="s"><v>', 5:13, '</v></c>',
                        collapse = ""),
                 '</row>')
   sst <- function(ref, i) paste0('<c r="', ref, '" t="s"><v>', i, '</v></c>')
@@ -343,19 +345,24 @@ gen("na.xlsx", {
   bool <- function(ref, v) paste0('<c r="', ref, '" t="b"><v>', v, '</v></c>')
   dat <- function(ref, v) paste0('<c r="', ref, '" s="1"><v>', v, '</v></c>')
   str <- function(ref, v) paste0('<c r="', ref, '" t="str"><v>', v, '</v></c>')
+  rich <- function(ref, runs) paste0('<c r="', ref, '" t="inlineStr"><is>',
+                                     paste0('<r><t>', runs, '</t></r>', collapse = ""),
+                                     '</is></c>')
   body <- paste0(hdr,
     '<row r="2">', num("A2", 1), sst("B2", 2), num("C2", 5),
                    str("D2", "N&amp;A"), sst("E2", 3), sst("F2", 0),
-                   dat("G2", 44197), '</row>',
+                   dat("G2", 44197), num("H2", 1), num("I2", 1), '</row>',
     '<row r="3">', num("A3", -999), sst("B3", 0), sst("C3", 1),
                    str("D3", "x&amp;y"), str("E3", "   "), sst("F3", 0),
-                   dat("G3", "44562.5"), '</row>',
+                   dat("G3", "44562.5"), str("H3", "N&amp;A"),
+                   rich("I3", c("N&amp;", "A")), '</row>',
     '<row r="4">', num("A4", 3), str("B4", " N/A "), bool("C4", 1),
                    str("D4", "&lt;z&gt;"), str("E4", "z"), sst("F4", 0),
-                   dat("G4", 30), '</row>',
+                   dat("G4", 30), num("H4", 3), num("I4", 3), '</row>',
     '<row r="5">', num("A5", "1e3"), sst("B5", 4), sst("C5", 0),
-                   str("D5", "q"), sst("F5", 0), dat("G5", 61), '</row>')
-  s1 <- sheet_xml("A1:G5", body)
+                   str("D5", "q"), sst("F5", 0), dat("G5", 61),
+                   num("H5", 4), num("I5", 4), '</row>')
+  s1 <- sheet_xml("A1:I5", body)
   write_xlsx_parts(file.path(out_dir, "na.xlsx"), base_parts(s1, sst = uniq))
 })
 
