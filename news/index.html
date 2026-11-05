@@ -35,6 +35,7 @@
     <div class="section level2">
 <h2 class="pkg-version" data-toc-text="0.1.2" id="rcxl-012">rcxl 0.1.2<a class="anchor" aria-label="anchor" href="#rcxl-012"></a></h2>
 <ul><li><p>Worker threads are now joined before an R error propagates. Previously an error while building text columns or parsing workbook metadata left them running and writing into freed memory, which could crash the session or corrupt data. A raw NUL byte in a cell was enough to trigger it.</p></li>
+<li><p>An <code>na</code> marker stored XML-escaped in the sheet, such as <code>N&amp;amp;A</code> for <code>"N&amp;A"</code>, or split across the rich-text runs of an inline string, is now matched before the column type is guessed. Previously such a cell counted as text, so a numeric column holding it came back as character instead of numeric with an NA.</p></li>
 <li><p>Documentation corrections. <code>RCXL_THREADS</code> overrides the 4 MB serial threshold rather than being bound by it, the architecture description no longer claims cells are decoded straight into R vectors, and the readxl comparison notes that <code>na</code> matches numeric cells by value.</p></li>
 </ul></div>
     <div class="section level2">
